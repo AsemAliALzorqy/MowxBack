@@ -1,0 +1,493 @@
+'use strict';
+
+let S = null;
+const PAGES = [
+  ['home', 'الرئيسية', 'home'], ['ledger', 'دفتر اليوم', 'book'],
+  ['profits', 'أرباح الأصناف', 'up'], ['expenses', 'المصروفات', 'receipt'],
+  ['withdrawals', 'سحبيات العمال', 'wallet'], ['reports', 'التقارير', 'chart'],
+  ['items', 'الأصناف', 'package'], ['workers', 'العمال', 'users'], ['settings', 'الإعدادات', 'settings'],
+];
+const MAIN = ['home', 'ledger', 'expenses', 'reports'];
+const TYPE = {
+  profit: ['ربح صنف', 'up', 'gain'],
+  expense: ['مصروف', 'receipt', 'loss'],
+  withdrawal: ['سحبية عامل', 'wallet', 'warn'],
+};
+const CURS = { SAR: 'الريال السعودي', JOD: 'د.أ', AED: 'د.إ', KWD: 'د.ك', USD: '$', EGP: 'ج.م' };
+const $ = (id) => document.getElementById(id);
+let page = 'home';
+let day = todayStr();
+let rng = { from: `${todayStr().slice(0, 8)}01`, to: todayStr() };
+let rep = { kind: 'month', day: todayStr(), from: rng.from, to: rng.to, cur: null };
+let q = '';
+let renderSequence = 0;
+
+const fmtNum = (n, max = 3) => new Intl.NumberFormat('en-US', { maximumFractionDigits: max }).format(Number(n) || 0);
+const normName = (name) => String(name || '').replace(/\s+/g, ' ').trim();
+const money = (n) => `<span class="num">${fmtNum(n, Number(S?.currencyDecimalPlaces ?? 3))}</span> ${S?.currencyCode === 'SAR' ? '<span class="currency-symbol" role="img" aria-label="ريال سعودي" title="ريال سعودي"></span>' : `<bdi>${esc(S?.currency || '')}</bdi>`}`;
+const netTxt = (n) => n >= 0 ? 'ربح' : 'خسارة';
+const inRange = (t, a, b) => t.date >= a && t.date <= b;
+
+function live() { return (S?.tx || []).filter((t) => !t.void); }
+function aLines(t) { return t.lines ? t.lines : [t]; }
+function sums(list) {
+  const result = { profit: 0, qty: 0, exp: 0, wd: 0 };
+  list.forEach((t) => {
+    if (t.type === 'profit') {
+      result.profit += Number(t.amount) || 0;
+      result.qty += Number(t.qty) || 0;
+    } else if (t.type === 'withdrawal') result.wd += Number(t.amount) || 0;
+    else result.exp += Number(t.amount) || 0;
+  });
+  result.totalExp = result.exp + result.wd;
+  result.net = result.profit - result.totalExp;
+  return result;
+}
+function stat(label, icon, cls, value) {
+  return `<div class="card"><div class="k">${ic(icon)} ${label}</div><div class="v ${cls}">${money(value)}</div></div>`;
+}
+function summary(s) {
+  return `<div class="grid c3">${stat('أرباح الأصناف', 'up', 'gain', s.profit)}${stat('المصروفات (شاملة السحبيات)', 'receipt', 'loss', s.totalExp)}${stat('منها سحبيات العمال', 'wallet', 'warn', s.wd)}</div>`;
+}
+function netCard(s) {
+  return `<div class="card net"><div class="k" style="color:#cbd5e1">${ic('chart')} صافي النتيجة</div><div class="big">${s.net >= 0 ? '+' : '−'}${money(Math.abs(s.net))}</div><div>${netTxt(s.net)}</div><small>صافي النتيجة = أرباح الأصناف − المصروفات (السحبيات محسوبة مرة واحدة ضمنها)</small></div>`;
+}
+function quick(date) {
+  return `<div class="btns"><button class="btn p" data-act="add" data-type="profit" data-date="${date}">${ic('plus')} إضافة ربح صنف</button><button class="btn p" data-act="add" data-type="expense" data-date="${date}">${ic('plus')} إضافة مصروف</button><button class="btn p" data-act="add" data-type="withdrawal" data-date="${date}">${ic('plus')} تسجيل سحبية عامل</button></div>`;
+}
+function dateBar(extra = '') {
+  return `<div class="bar"><label class="fld">من<input type="date" data-rng="from" value="${rng.from}"></label><label class="fld">إلى<input type="date" data-rng="to" value="${rng.to}"></label>${extra}</div>`;
+}
+function row(t) {
+  if (t.type === 'profit') return prow(t);
+  const [label, icon, cls] = TYPE[t.type];
+  return `<div class="row"><span class="${cls}">${ic(icon, 'l')}</span><div class="m"><div class="d">${esc(t.name || label)}</div><div class="s">${label} · ${esc(t.desc || t.note || '')} · <span class="num">${t.date}</span></div></div><b class="${cls}">${t.type === 'profit' ? '+' : '−'}${money(t.amount)}</b><button class="btn i" data-act="edit" data-id="${esc(t.id)}" aria-label="تعديل">${ic('pencil')}</button><button class="btn i" data-act="delete" data-id="${esc(t.id)}" aria-label="حذف">${ic('x')}</button></div>`;
+}
+function list(entries) {
+  return entries.length ? entries.map(row).join('') : '<div class="empty">لا توجد عمليات. ابدأ بإضافة عملية جديدة.</div>';
+}
+
+const V = {
+  home() {
+    const today = todayStr();
+    const entries = live().filter((t) => t.date === today);
+    const s = sums(entries);
+    return `<div class="grid">${netCard(s)}</div><h2 style="margin-top:12px"> </h2>${summary(s)}<h2>عمليات سريعة</h2>${quick(today)}<h2>آخر العمليات</h2><div class="card">${list(entries.slice(0, 8))}</div>`;
+  },
+  ledger() {
+    const entries = live().filter((t) => t.date === day);
+    const s = sums(entries);
+    return `<div class="bar"><label class="fld">التاريخ<input type="date" id="dayIn" value="${day}"></label></div>${netCard(s)}<div style="height:12px"></div>${summary(s)}<h2>إضافة</h2>${quick(day)}${['profit', 'expense', 'withdrawal'].map((kind) => `<h2>${TYPE[kind][0]}</h2><div class="card">${list(entries.filter((t) => t.type === kind))}</div>`).join('')}`;
+  },
+  list(type) {
+    const entries = live().filter((t) => t.type === type && inRange(t, rng.from, rng.to));
+    const s = sums(entries);
+    const total = type === 'profit' ? s.profit : type === 'expense' ? s.exp : s.wd;
+    let by = '';
+    const grouped = {};
+    entries.forEach((entry) => {
+      (entry.type === 'profit' ? aLines(entry) : [entry]).forEach((line) => {
+        const name = line.name || entry.name;
+        grouped[name] = grouped[name] || { amount: 0, qty: 0 };
+        grouped[name].amount += Number(line.amount) || 0;
+        grouped[name].qty += Number(line.qty) || 0;
+      });
+    });
+    if (Object.keys(grouped).length) {
+      by = `<h2>${type === 'withdrawal' ? 'حسب العامل' : type === 'profit' ? 'حسب الصنف' : 'حسب التصنيف'}</h2><div class="card">${Object.entries(grouped).map(([name, value]) => `<div class="row"><div class="m d">${esc(name)}${type === 'profit' ? ` — <span class="num">${fmtNum(value.qty)}</span>` : ''}</div><b>${money(value.amount)}</b></div>`).join('')}</div>`;
+    }
+    return `${dateBar(`<button class="btn p" data-act="add" data-type="${type}" data-date="${todayStr()}">${ic('plus')} إضافة</button>`)}<div class="card" style="margin-bottom:12px"><div class="k">المجموع${type === 'profit' ? ` — الكمية <span class="num">${fmtNum(s.qty)}</span>` : ''}</div><div class="v ${TYPE[type][2]}">${money(total)}</div>${type === 'withdrawal' ? '<div class="sub">تُحتسب ضمن المصروفات مرة واحدة</div>' : ''}</div><div class="card">${list(entries.slice().sort((a, b) => b.date.localeCompare(a.date)))}</div>${by}`;
+  },
+  reports() {
+    const data = rep.cur;
+    if (!data) return '<div class="empty">جارٍ تحميل التقرير من قاعدة البيانات...</div>';
+    const s = data.totals;
+    const l = data.transactions;
+    const tb = (rows, renderRow) => rows.length ? `<table>${rows.map(renderRow).join('')}</table>` : '<div class="empty">لا توجد بيانات</div>';
+    const period = `الفترة: <span class="num">${data.from}</span> إلى <span class="num">${data.to}</span>`;
+    return `<div class="bar"><label class="fld">نوع التقرير<select id="repKind"><option value="day"${rep.kind === 'day' ? ' selected' : ''}>يومي</option><option value="month"${rep.kind === 'month' ? ' selected' : ''}>شهري</option><option value="range"${rep.kind === 'range' ? ' selected' : ''}>من تاريخ إلى تاريخ</option></select></label>${rep.kind === 'range' ? `<label class="fld">من<input type="date" data-rep="from" value="${rep.from}"></label><label class="fld">إلى<input type="date" data-rep="to" value="${rep.to}"></label>` : `<label class="fld">التاريخ<input type="date" data-rep="day" value="${rep.day}"></label>`}</div><div class="bar"><button class="btn" data-act="pdf">${ic('download')} تصدير PDF (طباعة)</button><button class="btn" data-act="xls">${ic('download')} تصدير Excel (CSV)</button></div><div class="sub">${period}</div><div style="height:8px"></div>${netCard(s)}<h2>أرباح الأصناف</h2><div class="card scroll">${tb(data.items, (v) => `<tr><td>${esc(v.name)}</td><td><span class="num">${fmtNum(v.qty)}</span></td><td>${money(v.amount)}</td></tr>`)}<div class="row"><b class="m">إجمالي الأرباح (الكمية <span class="num">${fmtNum(s.qty)}</span>)</b><b class="gain">${money(s.profit)}</b></div></div><h2>المصروفات حسب التصنيف</h2><div class="card scroll">${tb(data.categories, (v) => `<tr><td>${esc(v.name)}</td><td>${money(v.amount)}</td></tr>`)}</div><h2>سحبيات العمال (تفصيل ضمن المصروفات)</h2><div class="card scroll">${tb(data.workers, (v) => `<tr><td>${esc(v.name)}</td><td>${money(v.amount)}</td></tr>`)}</div><h2>تفاصيل العمليات</h2><div class="card">${list(l)}</div><div class="card" style="margin-top:12px"><div class="row"><span class="m">مصروفات التصنيفات</span>${money(s.exp)}</div><div class="row"><span class="m">سحبيات العمال</span>${money(s.wd)}</div><div class="row"><b class="m">إجمالي المصروفات</b><b class="loss">${money(s.totalExp)}</b></div></div>`;
+  },
+  mgmt(kind) {
+    const entries = (S[kind] || []).filter((item) => item.name.includes(q));
+    const label = { items: 'صنف', workers: 'عامل', cats: 'تصنيف' }[kind];
+    return `<div class="bar"><label class="fld">بحث<input type="search" id="q" value="${esc(q)}" placeholder="ابحث بالاسم"></label><button class="btn p" data-act="madd" data-k="${kind}">${ic('plus')} إضافة ${label}</button></div><div class="card">${entries.length ? entries.map((item) => `<div class="row"><div class="m d">${esc(item.name)}</div><span class="badge ${item.active ? 'gain' : 'warn'}">${item.active ? 'نشط' : 'موقوف'}</span><button class="btn i" data-act="medit" data-k="${kind}" data-id="${esc(item.id)}" aria-label="تعديل">${ic('pencil')}</button><button class="btn" data-act="mtog" data-k="${kind}" data-id="${esc(item.id)}">${item.active ? 'إيقاف' : 'تفعيل'}</button></div>`).join('') : '<div class="empty">لا توجد نتائج</div>'}</div><div class="sub" style="margin-top:8px">الإيقاف لا يحذف السجلات السابقة.</div>`;
+  },
+  settings() {
+    const runtime = S.runtime || {};
+    const log = S.log || [];
+    const opNames = { create: 'إضافة', update: 'تعديل', soft_delete: 'حذف منطقي', activate: 'تفعيل', deactivate: 'إيقاف', backup_restore: 'استعادة نسخة', import: 'استيراد' };
+    return `<div class="card"><label class="fld">العملة<select id="curCode">${Object.entries(CURS).map(([code, symbol]) => `<option value="${code}"${S.currencyCode === code ? ' selected' : ''}>${code} — ${symbol}</option>`).join('')}<option value="custom"${S.currencyCode === 'custom' ? ' selected' : ''}>أخرى (نص مخصص)</option></select></label><label class="fld">النص المخصص (عند اختيار أخرى)<input id="cur" value="${esc(S.currency)}" maxlength="12"></label><button class="btn p" data-act="cur">حفظ العملة</button></div>${backupCard(runtime)}<h2>الإدارة</h2><div class="btns"><button class="btn" data-go="items">${ic('package')} الأصناف</button><button class="btn" data-go="workers">${ic('users')} العمال</button><button class="btn" data-act="cats">${ic('receipt')} تصنيفات المصروفات</button></div><h2>سجل التغييرات</h2><div class="card">${log.length ? log.slice(0, 40).map((entry) => { const detail = entry.after || entry.before || {}; const name = detail.name || detail.item_name || detail.category_name_snapshot || detail.worker_name_snapshot || entry.entityId; return `<div class="row"><div class="m"><div class="d">${opNames[entry.op] || entry.op} — ${esc(name)}</div><div class="s">${new Date(entry.at).toLocaleString('ar-EG-u-nu-latn')} · ${esc(entry.entityType || '')}</div></div></div>`; }).join('') : '<div class="empty">لا توجد تغييرات</div>'}</div><h2>معلومات النظام</h2><div class="card sub">MowxBack — تخزين محلي عبر SQLite. إصدار قاعدة البيانات: ${esc(runtime.databaseVersion ?? '')}<br>مسار القاعدة: ${esc(runtime.databasePath || 'غير متاح')}<br>الفحص: ${runtime.integrityOk ? 'سليم' : 'لم يُفحص بعد أو توجد مشكلة'}<br>لا توجد مزامنة أو اتصال سحابي.</div>`;
+  },
+};
+
+function reportRange() {
+  if (rep.kind === 'day') return { from: rep.day, to: rep.day };
+  if (rep.kind === 'month') {
+    const first = `${rep.day.slice(0, 8)}01`;
+    const date = new Date(Number(rep.day.slice(0, 4)), Number(rep.day.slice(5, 7)), 0);
+    const last = `${rep.day.slice(0, 8)}${String(date.getDate()).padStart(2, '0')}`;
+    return { from: first, to: last };
+  }
+  return { from: rep.from, to: rep.to };
+}
+
+async function render() {
+  if (!S) return;
+  const sequence = ++renderSequence;
+  if (page === 'reports') {
+    const range = reportRange();
+    try {
+      rep.cur = await Store.report(range.from, range.to);
+    } catch (error) {
+      if (sequence === renderSequence) $('view').innerHTML = `<div class="empty loss">تعذر استخراج التقرير من SQLite: ${esc(error.message)}</div>`;
+      return;
+    }
+    if (sequence !== renderSequence) return;
+  }
+  const current = PAGES.find((entry) => entry[0] === page) || PAGES[0];
+  $('pageTitle').textContent = current[1];
+  $('pageDate').textContent = fmtDate(todayStr());
+  const views = {
+    home: V.home, ledger: V.ledger, profits: () => V.list('profit'),
+    expenses: () => V.list('expense'), withdrawals: () => V.list('withdrawal'),
+    reports: V.reports, items: () => V.mgmt('items'), workers: () => V.mgmt('workers'),
+    cats: () => V.mgmt('cats'), settings: V.settings,
+  };
+  try { $('view').innerHTML = (views[page] || V.home)(); }
+  catch (error) { console.error(error); $('view').innerHTML = '<div class="empty loss">تعذر عرض الصفحة</div>'; }
+  $('side').innerHTML = '<div class="logo">MowxBack</div>' + PAGES.map((entry) => `<button data-go="${entry[0]}" class="${entry[0] === page ? 'on' : ''}">${ic(entry[2])}${entry[1]}</button>`).join('');
+  const active = MAIN.includes(page) ? page : 'more';
+  $('bottom').innerHTML = MAIN.map((key) => { const entry = PAGES.find((item) => item[0] === key); return `<button data-go="${key}" class="${active === key ? 'on' : ''}">${ic(entry[2])}${entry[1]}</button>`; }).join('') + `<button data-act="more" class="${active === 'more' ? 'on' : ''}">${ic('menu')}المزيد</button>`;
+  $('status').innerHTML = `<span class="pill ok">${ic('check', 's')} SQLite محلي</span><span>الحفظ على هذا الجهاز</span>`;
+}
+
+async function refreshState() {
+  S = await Store.load();
+  await render();
+}
+function go(nextPage) { page = nextPage; q = ''; closeM(); render(); window.scrollTo(0, 0); }
+function closeM() { $('modal').hidden = true; $('modal').innerHTML = ''; }
+function showError(error) {
+  console.error(error);
+  toast(error?.message ? `تعذر تنفيذ العملية: ${error.message}` : 'تعذر تنفيذ العملية', 'err');
+}
+function backupCard(runtime) {
+  const folder = runtime.backupDirectory;
+  return `<h2>قاعدة البيانات والنسخ الاحتياطي</h2><div class="card"><div class="sub" style="margin-bottom:12px">ملف SQLite محفوظ خارج مجلد تثبيت البرنامج. مجلد النسخ الاحتياطي مستقل عن مجلد قاعدة البيانات.</div><div class="row"><div class="m"><div class="s">موقع قاعدة البيانات</div><div class="d">${esc(runtime.databasePath || 'غير محدد')}</div></div><button class="btn" data-act="dbfolder">تغيير المجلد</button></div><div class="row"><div class="m"><div class="s">مجلد النسخ الاحتياطي</div><div class="d">${folder ? esc(folder) : 'لم يُحدد مجلد'}</div></div></div><div class="btns"><button class="btn p" data-act="bpick">${folder ? 'تغيير مجلد النسخ' : 'اختيار مجلد النسخ'}</button>${folder ? '<button class="btn" data-act="bdel">إزالة اختيار المجلد</button><button class="btn" data-act="bsave">حفظ نسخة في المجلد</button>' : ''}<button class="btn" data-act="bdl">حفظ نسخة باسم...</button><button class="btn" data-act="brestore">استعادة نسخة SQLite</button><button class="btn" data-act="bimport">استيراد JSON قديم</button><button class="btn" data-act="bjson">تصدير JSON</button><button class="btn" data-act="bintegrity">فحص سلامة القاعدة</button></div><div class="sub" style="margin-top:8px">النسخ الاحتياطي التلقائي اليومي غير مفعل في هذا الإصدار.</div></div>`;
+}
+
+function form(title, fields, values, onSave) {
+  $('modal').hidden = false;
+  $('modal').innerHTML = `<div class="sheet" role="dialog" aria-label="${esc(title)}"><h3>${esc(title)}</h3><div id="ff">${fields.map((field) => `<label class="fld">${field.l}${field.t === 'select' ? `<select name="${field.k}">${field.o.map((option) => `<option value="${esc(option[0])}"${option[0] === values[field.k] ? ' selected' : ''}>${esc(option[1])}</option>`).join('')}</select>` : field.t === 'area' ? `<textarea name="${field.k}">${esc(values[field.k] || '')}</textarea>` : `<input name="${field.k}" type="${field.t || 'text'}" ${field.t === 'number' ? 'step="any" min="0" inputmode="decimal"' : ''} value="${esc(values[field.k] ?? '')}">`}<span class="err" data-e="${field.k}"></span></label>`).join('')}</div><div class="btns" style="grid-template-columns:1fr 1fr"><button class="btn p" id="fs">حفظ</button><button class="btn" id="fc">إلغاء</button></div></div>`;
+  $('fc').onclick = closeM;
+  $('fs').onclick = async () => {
+    const data = {};
+    let valid = true;
+    fields.forEach((field) => {
+      const element = document.querySelector(`[name="${field.k}"]`);
+      data[field.k] = element.value.trim();
+      const errorElement = document.querySelector(`[data-e="${field.k}"]`);
+      errorElement.textContent = '';
+      if (field.r && !data[field.k]) { errorElement.textContent = 'هذا الحقل مطلوب'; valid = false; }
+      else if (field.t === 'number' && data[field.k] && !(Number(data[field.k]) > 0)) { errorElement.textContent = 'أدخل رقماً أكبر من صفر'; valid = false; }
+    });
+    if (!valid) return;
+    try { await onSave(data); } catch (error) { showError(error); }
+  };
+}
+
+function txForm(transaction) {
+  const isNew = !transaction.id;
+  const type = transaction.type;
+  if (type === 'profit') return profitMulti(transaction.date || todayStr());
+  const refs = type === 'withdrawal' ? S.workers : S.cats;
+  const options = refs.filter((item) => item.active || item.id === transaction.refId).map((item) => [item.id, item.name]);
+  if (!options.length) { toast('أضف عنصراً نشطاً من الإدارة أولاً', 'err'); return; }
+  const fields = [
+    { k: 'date', l: 'التاريخ', t: 'date', r: true },
+    { k: 'refId', l: type === 'withdrawal' ? 'العامل' : 'التصنيف', t: 'select', o: options, r: true },
+    { k: 'amount', l: type === 'expense' ? 'المبلغ' : 'المبلغ', t: 'number', r: true },
+  ];
+  if (type === 'expense') fields.push({ k: 'desc', l: 'الوصف', r: true });
+  fields.push({ k: 'note', l: 'ملاحظات (اختياري)', t: 'area' });
+  form(`${isNew ? 'إضافة ' : 'تعديل '}${TYPE[type][0]}`, fields, transaction, async (values) => {
+    const payload = { date: values.date, refId: values.refId, amount: values.amount, desc: values.desc || '', note: values.note || '' };
+    if (isNew) {
+      if (type === 'expense') await Store.createExpense(payload);
+      else await Store.createWithdrawal(payload);
+    } else if (type === 'expense') await Store.updateExpense({ id: transaction.id, patch: payload });
+    else await Store.updateWithdrawal({ id: transaction.id, patch: payload });
+    closeM(); await refreshState(); toast(isNew ? 'تمت الإضافة' : 'تم حفظ التعديل');
+  });
+}
+
+function catalogForm(kind, item) {
+  const isNew = !item;
+  form(isNew ? 'إضافة' : 'تعديل', [{ k: 'name', l: 'الاسم', r: true }], item || {}, async (values) => {
+    if ((S[kind] || []).some((entry) => entry.name.trim() === values.name && (!item || entry.id !== item.id))) {
+      toast('الاسم موجود مسبقاً', 'err'); return;
+    }
+    await Store.saveCatalog({ kind, id: item?.id, name: values.name });
+    closeM(); await refreshState(); toast('تم الحفظ');
+  });
+}
+
+function lineEdit(transaction, line) {
+  form('تعديل صنف', [
+    { k: 'name', l: 'اسم الصنف', r: true },
+    { k: 'qty', l: 'الكمية', t: 'number', r: true },
+    { k: 'amount', l: 'إجمالي الربح', t: 'number', r: true },
+    { k: 'note', l: 'ملاحظات (اختياري)', t: 'area' },
+  ], line, async (values) => {
+    if (!normName(values.name)) { toast('أدخل اسم الصنف', 'err'); return; }
+    await Store.updateProfitLine({ transactionId: transaction.id, lineId: line.id, patch: {
+      name: normName(values.name), qty: values.qty, amount: values.amount, note: values.note,
+    } });
+    closeM(); await refreshState(); toast('تم حفظ التعديل');
+    const latest = S.tx.find((entry) => entry.id === transaction.id);
+    if (latest) profitDetail(latest.id);
+  });
+  attachSuggest(document.querySelector('#ff [name="name"]'));
+}
+
+function profitDetail(id) {
+  const transaction = S.tx.find((entry) => entry.id === id);
+  if (!transaction || transaction.void || !transaction.lines) { closeM(); return; }
+  $('modal').hidden = false;
+  $('modal').innerHTML = `<div class="sheet" style="max-width:640px"><h3>تفاصيل حركة أرباح</h3><div class="sub"><label class="fld">التاريخ<input type="date" id="pdDate" value="${transaction.date}"></label><button class="btn" id="pdDateSave">حفظ التاريخ</button></div><div class="scroll"><table style="min-width:420px"><thead><tr><th>الصنف</th><th>الكمية</th><th>إجمالي الربح</th><th>الإجراءات</th></tr></thead><tbody>${aLines(transaction).map((line) => `<tr><td>${esc(line.name)}${line.note ? `<div class="s">${esc(line.note)}</div>` : ''}</td><td><span class="num">${fmtNum(line.qty)}</span></td><td><b class="gain">${money(line.amount)}</b></td><td style="white-space:nowrap"><button class="btn i" data-le="${esc(line.id)}" aria-label="تعديل ${esc(line.name)}">${ic('pencil')}</button> <button class="btn i" data-ld="${esc(line.id)}" aria-label="حذف ${esc(line.name)}">${ic('x')}</button></td></tr>`).join('')}</tbody></table></div><div class="row"><b class="m">إجمالي أرباح الحركة</b><b class="gain" style="font-size:20px">${money(transaction.amount)}</b></div><div class="btns"><button class="btn" data-act="pddelete" data-id="${esc(transaction.id)}">حذف الحركة</button><button class="btn" id="pdClose">إغلاق</button></div></div>`;
+  $('pdClose').onclick = closeM;
+  $('pdDateSave').onclick = async () => {
+    try {
+      await Store.updateProfitDate({ id: transaction.id, date: $('pdDate').value });
+      closeM(); await refreshState(); toast('تم تحديث تاريخ الحركة');
+      const latest = S.tx.find((entry) => entry.id === transaction.id); if (latest) profitDetail(latest.id);
+    } catch (error) { showError(error); }
+  };
+  $('modal').querySelectorAll('[data-le]').forEach((button) => {
+    button.onclick = () => lineEdit(transaction, transaction.lines.find((line) => line.id === button.dataset.le));
+  });
+  $('modal').querySelectorAll('[data-ld]').forEach((button) => {
+    button.onclick = async () => {
+      if (!confirm('حذف هذا الصنف من الحركة؟ يبقى أثره في سجل التغييرات.')) return;
+      try {
+        await Store.deleteProfitLine({ transactionId: transaction.id, lineId: button.dataset.ld });
+        closeM(); await refreshState(); toast('تم حذف الصنف');
+        const latest = S.tx.find((entry) => entry.id === transaction.id); if (latest) profitDetail(latest.id);
+      } catch (error) { showError(error); }
+    };
+  });
+}
+
+function prow(transaction) {
+  const lines = aLines(transaction);
+  return `<div class="row"><span class="gain">${ic('up', 'l')}</span><div class="m"><div class="d">${lines.length === 1 ? esc(lines[0].name) : 'حركة أرباح أصناف'}</div><div class="s">عدد الأصناف <span class="num">${lines.length}</span> · الكمية <span class="num">${fmtNum(transaction.qty)}</span> · <span class="num">${transaction.date}</span></div></div><b class="gain">+${money(transaction.amount)}</b><button class="btn" data-act="detail" data-id="${esc(transaction.id)}">عرض التفاصيل</button></div>`;
+}
+
+function profitMulti(date) {
+  let rows = [];
+  let edit = -1;
+  let current = { name: '', qty: '', amount: '', note: '' };
+  let saving = false;
+  const total = () => rows.reduce((sum, item) => sum + item.amount, 0);
+  const value = (name) => document.querySelector(`#pm [name="${name}"]`);
+  const error = (key, message) => { const element = document.querySelector(`#pm [data-e="${key}"]`); if (element) element.textContent = message || ''; };
+  const readRow = () => {
+    date = value('date').value;
+    ['date', 'name', 'qty', 'amount'].forEach((key) => error(key, ''));
+    let valid = true;
+    if (!date) { error('date', 'هذا الحقل مطلوب'); valid = false; }
+    const quantity = Number(value('qty').value);
+    const amount = Number(value('amount').value);
+    if (!(quantity > 0)) { error('qty', 'أدخل كمية أكبر من صفر'); valid = false; }
+    if (!(amount > 0)) { error('amount', 'أدخل رقماً أكبر من صفر'); valid = false; }
+    const name = normName(value('name').value);
+    if (!name) { error('name', 'أدخل اسم الصنف'); valid = false; }
+    return valid ? { id: rows[edit]?.id || undefined, name, qty: quantity, amount, note: value('note').value.trim() } : null;
+  };
+  const commit = () => {
+    const line = readRow();
+    if (!line) return false;
+    if (edit >= 0) rows[edit] = line; else rows.push(line);
+    edit = -1; current = { name: '', qty: '', amount: '', note: '' };
+    return true;
+  };
+  const draw = () => {
+    $('modal').hidden = false;
+    $('modal').innerHTML = `<div class="sheet" id="pm" role="dialog" aria-label="إضافة أرباح أصناف" style="max-width:640px"><h3>إضافة أرباح أصناف</h3><label class="fld">التاريخ<input name="date" type="date" value="${date}"><span class="err" data-e="date"></span></label><label class="fld">اسم الصنف<input name="name" type="text" value="${esc(current.name)}" placeholder="اكتب اسم الصنف" autocomplete="off"><span class="err" data-e="name"></span></label><div class="grid c2"><label class="fld">الكمية<input name="qty" type="number" step="any" min="0" inputmode="decimal" value="${esc(current.qty)}"><span class="err" data-e="qty"></span></label><label class="fld">إجمالي الربح<input name="amount" type="number" step="any" min="0" inputmode="decimal" value="${esc(current.amount)}"><span class="err" data-e="amount"></span></label></div><label class="fld">ملاحظات (اختياري)<textarea name="note">${esc(current.note)}</textarea></label><div class="btns" style="grid-template-columns:1fr${edit >= 0 ? ' 1fr' : ''};margin-bottom:16px"><button class="btn" id="pmAdd">${ic(edit >= 0 ? 'check' : 'plus')} ${edit >= 0 ? 'تحديث الصنف' : 'إضافة إلى القائمة'}</button>${edit >= 0 ? '<button class="btn" id="pmCancel">إلغاء التعديل</button>' : ''}</div><div class="scroll"><table style="min-width:420px"><thead><tr><th>الصنف</th><th>الكمية</th><th>إجمالي الربح</th><th>الإجراءات</th></tr></thead><tbody>${rows.length ? rows.map((line, index) => `<tr><td>${esc(line.name)}${line.note ? `<div class="s">${esc(line.note)}</div>` : ''}</td><td><span class="num">${fmtNum(line.qty)}</span></td><td><b class="gain">${money(line.amount)}</b></td><td style="white-space:nowrap"><button class="btn i" data-pe="${index}" aria-label="تعديل ${esc(line.name)}">${ic('pencil')}</button> <button class="btn i" data-pr="${index}" aria-label="إزالة ${esc(line.name)}">${ic('x')}</button></td></tr>`).join('') : '<tr><td colspan="4" class="empty">لم تُضف أصناف بعد</td></tr>'}</tbody></table></div><div class="row"><b class="m">إجمالي أرباح جميع الأصناف (<span class="num">${rows.length}</span>)</b><b class="gain" style="font-size:20px">${money(total())}</b></div><div class="btns" style="grid-template-columns:1fr 1fr;margin-top:12px"><button class="btn p" id="pmSave">حفظ جميع الأصناف</button><button class="btn" id="pmClose">إلغاء</button></div></div>`;
+    attachSuggest(value('name'));
+    value('date').onchange = () => { date = value('date').value; };
+    $('pmClose').onclick = closeM;
+    if ($('pmCancel')) $('pmCancel').onclick = () => { edit = -1; current = { name: '', qty: '', amount: '', note: '' }; draw(); };
+    $('pmAdd').onclick = () => { if (commit()) draw(); };
+    $('modal').querySelectorAll('[data-pe]').forEach((button) => {
+      button.onclick = () => { date = value('date').value; edit = Number(button.dataset.pe); const line = rows[edit]; current = { name: line.name, qty: line.qty, amount: line.amount, note: line.note }; draw(); };
+    });
+    $('modal').querySelectorAll('[data-pr]').forEach((button) => {
+      button.onclick = () => { date = value('date').value; const index = Number(button.dataset.pr); rows.splice(index, 1); if (edit === index) { edit = -1; current = { name: '', qty: '', amount: '', note: '' }; } else if (edit > index) edit -= 1; draw(); };
+    });
+    $('pmSave').onclick = async () => {
+      if (saving) return;
+      date = value('date').value; error('date', '');
+      if (!date) { error('date', 'هذا الحقل مطلوب'); return; }
+      if (value('qty').value || value('amount').value || edit >= 0) { if (!commit()) return; }
+      if (!rows.length) { toast('أضف صنفاً واحداً على الأقل', 'err'); return; }
+      saving = true; $('pmSave').disabled = true;
+      try {
+        await Store.saveProfit({ date, lines: rows.map((line) => ({ ...line, id: line.id || uid() })) });
+        const count = rows.length; closeM(); await refreshState(); toast(`تم حفظ حركة تحتوي ${count} من الأصناف`);
+      } catch (errorValue) { saving = false; $('pmSave').disabled = false; showError(errorValue); }
+    };
+  };
+  draw();
+}
+
+function attachSuggest(input) {
+  if (!input) return;
+  const box = document.createElement('div');
+  box.className = 'sugbox'; box.hidden = true; box.setAttribute('role', 'listbox');
+  input.insertAdjacentElement('afterend', box);
+  input.setAttribute('autocomplete', 'off');
+  let items = []; let highlight = -1; let requestNumber = 0;
+  const close = () => { box.hidden = true; box.innerHTML = ''; items = []; highlight = -1; };
+  const pick = (name) => { input.value = name; close(); input.focus(); };
+  const paint = () => [...box.children].forEach((child, index) => child.classList.toggle('on', index === highlight));
+  const open = async () => {
+    const query = input.value;
+    if (normName(query).length < 2) { close(); return; }
+    const request = ++requestNumber;
+    try {
+      const suggestions = await Store.searchNames(query);
+      if (request !== requestNumber || input.value !== query) return;
+      items = suggestions;
+      if (!items.length) { close(); return; }
+      box.innerHTML = items.map((name, index) => `<div class="sug" role="option" data-i="${index}">${esc(name)}</div>`).join('');
+      box.hidden = false; highlight = -1;
+    } catch (error) { console.error('Name suggestions unavailable:', error); close(); }
+  };
+  input.addEventListener('input', open);
+  input.addEventListener('keydown', (event) => {
+    if (box.hidden) return;
+    if (event.key === 'ArrowDown') { event.preventDefault(); highlight = (highlight + 1) % items.length; paint(); }
+    else if (event.key === 'ArrowUp') { event.preventDefault(); highlight = (highlight - 1 + items.length) % items.length; paint(); }
+    else if (event.key === 'Enter' && highlight >= 0) { event.preventDefault(); pick(items[highlight]); }
+    else if (event.key === 'Escape') { event.stopPropagation(); close(); }
+  });
+  box.addEventListener('mousedown', (event) => { const element = event.target.closest('.sug'); if (element) { event.preventDefault(); pick(items[Number(element.dataset.i)]); } });
+  document.addEventListener('mousedown', function outside(event) { if (!document.body.contains(input)) { document.removeEventListener('mousedown', outside); return; } if (event.target !== input && !box.contains(event.target)) close(); });
+}
+
+async function deleteTransaction(transaction) {
+  if (!transaction) return;
+  const typeName = TYPE[transaction.type][0];
+  if (!confirm(`تأكيد حذف ${typeName}؟ سيُحتفظ بسجل التغيير.`)) return;
+  if (transaction.type === 'expense') await Store.deleteExpense({ id: transaction.id });
+  else if (transaction.type === 'withdrawal') await Store.deleteWithdrawal({ id: transaction.id });
+  else await Store.deleteProfit({ id: transaction.id });
+  closeM(); await refreshState(); toast('تم الحذف المنطقي للعملية');
+}
+
+function csv() {
+  const report = rep.cur;
+  if (!report) return;
+  const rows = [['النوع', 'التاريخ', 'اسم الصنف/الجهة', 'الكمية', 'المبلغ', 'الوصف/الملاحظات']];
+  const typeNames = { profit: 'ربح صنف', expense: 'مصروف', withdrawal: 'سحبية' };
+  report.transactions.forEach((transaction) => {
+    if (transaction.type === 'profit') transaction.lines.forEach((line) => rows.push([typeNames.profit, transaction.date, line.name, line.qty, line.amount, line.note]));
+    else rows.push([typeNames[transaction.type], transaction.date, transaction.name, '', transaction.amount, transaction.desc || transaction.note]);
+  });
+  const totals = report.totals;
+  rows.push([], ['إجمالي الأرباح', '', '', totals.qty, totals.profit], ['إجمالي المصروفات (تشمل السحبيات)', '', '', '', totals.totalExp], ['منها سحبيات', '', '', '', totals.wd], ['صافي النتيجة', '', '', '', totals.net]);
+  try {
+    const content = '\ufeff' + rows.map((rowValues) => rowValues.map((cell) => `"${String(cell ?? '').replace(/"/g, '""')}"`).join(',')).join('\n');
+    const blob = new Blob([content], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob); const anchor = document.createElement('a');
+    anchor.href = url; anchor.download = `mowxback-${report.from}_${report.to}.csv`; anchor.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000); toast('تم التصدير');
+  } catch (error) { showError(error); }
+}
+
+async function runBackupAction(action) {
+  let result;
+  if (action === 'dbfolder') result = await Backup.chooseDatabaseFolder();
+  else if (action === 'bpick') result = await Backup.chooseFolder();
+  else if (action === 'bdel') result = await Backup.clearFolder();
+  else if (action === 'bsave') result = await Backup.create();
+  else if (action === 'bdl') result = await Backup.saveAs();
+  else if (action === 'brestore') result = await Backup.restore();
+  else if (action === 'bimport') result = await Backup.importJson();
+  else if (action === 'bjson') result = await Backup.exportJson();
+  else if (action === 'bintegrity') result = await Backup.integrity();
+  if (result?.canceled) return;
+  if (action === 'bimport') {
+    toast(`اكتمل الاستيراد: ${JSON.stringify(result.counts || {})}`);
+  } else if (action === 'bintegrity') {
+    toast(result.ok ? 'قاعدة البيانات سليمة' : 'فشل فحص سلامة قاعدة البيانات', result.ok ? 'ok' : 'err');
+  } else if (action === 'brestore') toast('تمت استعادة النسخة الاحتياطية');
+  else if (action === 'bsave' || action === 'bdl') toast('تم إنشاء النسخة الاحتياطية');
+  else if (action === 'bimport') toast('تم استيراد البيانات');
+  else if (action === 'bjson') toast('تم تصدير JSON');
+  else if (action === 'bpick') toast('تم تحديد مجلد النسخ');
+  else if (action === 'bdel') toast('تمت إزالة مجلد النسخ');
+  await refreshState();
+}
+
+document.addEventListener('click', async (event) => {
+  const element = event.target.closest('[data-act],[data-go]');
+  if (!element) return;
+  if (element.dataset.go) { go(element.dataset.go); return; }
+  const { act, type, date, id, k } = element.dataset;
+  try {
+    if (act === 'add') txForm({ type, date, refId: '', amount: '', qty: '', desc: '', note: '' });
+    else if (act === 'edit') { const transaction = S.tx.find((entry) => entry.id === id); if (transaction) txForm(transaction); }
+    else if (act === 'delete') await deleteTransaction(S.tx.find((entry) => entry.id === id));
+    else if (act === 'madd') catalogForm(k);
+    else if (act === 'medit') catalogForm(k, S[k].find((entry) => entry.id === id));
+    else if (act === 'mtog') {
+      const item = S[k].find((entry) => entry.id === id);
+      await Store.setCatalogActive({ kind: k, id, active: !item.active });
+      await refreshState(); toast(item.active ? 'تم الإيقاف' : 'تم التفعيل');
+    } else if (act === 'cats') go('cats');
+    else if (act === 'detail') profitDetail(id);
+    else if (act === 'pddelete') await deleteTransaction(S.tx.find((entry) => entry.id === id));
+    else if (['dbfolder', 'bpick', 'bdel', 'bsave', 'bdl', 'brestore', 'bimport', 'bjson', 'bintegrity'].includes(act)) await runBackupAction(act);
+    else if (act === 'cur') {
+      const code = $('curCode').value; const label = $('cur').value.trim();
+      if (code === 'custom' && !label) { toast('أدخل اسم العملة', 'err'); return; }
+      await Store.setCurrency({ code, label }); await refreshState(); toast('تم تغيير العملة');
+    } else if (act === 'more') {
+      $('modal').hidden = false;
+      $('modal').innerHTML = `<div class="sheet"><h3>المزيد</h3><div class="grid">${PAGES.filter((entry) => !MAIN.includes(entry[0])).map((entry) => `<button class="btn" data-go="${entry[0]}">${ic(entry[2])}${entry[1]}</button>`).join('')}<button class="btn" id="fc2">إغلاق</button></div></div>`;
+      $('fc2').onclick = closeM;
+    } else if (act === 'pdf') window.print();
+    else if (act === 'xls') csv();
+  } catch (error) { showError(error); }
+});
+
+document.addEventListener('change', async (event) => {
+  const target = event.target;
+  if (target.id === 'dayIn' && target.value) { day = target.value; await render(); }
+  else if (target.dataset.rng) { rng[target.dataset.rng] = target.value; await render(); }
+  else if (target.id === 'repKind') { rep.kind = target.value; await render(); }
+  else if (target.dataset.rep) { rep[target.dataset.rep] = target.value; await render(); }
+});
+document.addEventListener('input', (event) => {
+  if (event.target.id === 'q') {
+    q = event.target.value;
+    const position = event.target.selectionStart;
+    render().then(() => { const input = $('q'); if (input) { input.focus(); input.setSelectionRange(position, position); } });
+  }
+});
+$('modal').addEventListener('click', (event) => { if (event.target.id === 'modal') closeM(); });
+document.addEventListener('keydown', (event) => { if (event.key === 'Escape') closeM(); });
+
+(async function startApplication() {
+  try {
+    S = await Store.load();
+    if (!S || !Array.isArray(S.tx)) throw new Error('لم تُرجع قاعدة البيانات بيانات صالحة.');
+    await render();
+  } catch (error) {
+    console.error(error);
+    $('view').innerHTML = `<div class="card loss"><h2>تعذر تحميل قاعدة البيانات</h2><p>${esc(error.message)}</p><p>لم يتم إنشاء قاعدة بيانات بديلة أو استخدام التخزين المحلي كبديل.</p></div>`;
+    $('status').textContent = 'قاعدة البيانات غير متاحة';
+  }
+})();

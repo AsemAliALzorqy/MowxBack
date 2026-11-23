@@ -1,0 +1,27 @@
+# Dependencies and build output
+node_modules/
+release/
+dist/
+artifacts/
+
+# Local databases and SQLite sidecars
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+Data/
+Backup/
+Backups/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*runtime*.json
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,56 @@
+name: Build MowxBack for Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'index.html'
+      - 'css/**'
+      - 'js/**'
+      - 'electron/**'
+      - 'src/**'
+      - 'database/**'
+      - 'docs/**'
+      - 'reference/**'
+      - 'README.md'
+      - '.gitignore'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/build-windows.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Rebuild SQLite native module for Electron
+        run: npm run rebuild:native
+
+      - name: Run foundation tests
+        run: npm test
+
+      - name: Package Windows installer
+        run: npx electron-builder --win nsis --x64
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: MowxBack-Windows-x64
+          path: release/*.exe
+          if-no-files-found: error
+          retention-days: 14
