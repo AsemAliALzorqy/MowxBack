@@ -4,6 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 MIGRATION = ROOT / 'database' / 'migrations' / '001_initial.sql'
+AUDIT_MIGRATION = ROOT / 'database' / 'migrations' / '002_audit_log_append_only.sql'
 NOW = '2026-11-23T18:00:00.000Z'
 
 
@@ -173,6 +174,27 @@ class MowxBackDatabaseTests(unittest.TestCase):
         row = self.db.execute("SELECT before_json,after_json FROM audit_log WHERE id='log-1'").fetchone()
         self.assertEqual(row['before_json'], '{"amount":10}')
         self.assertEqual(row['after_json'], '{"amount":12}')
+
+    def test_audit_append_only_migration_preserves_history_and_blocks_mutation(self):
+        legacy = sqlite3.connect(':memory:')
+        legacy.row_factory = sqlite3.Row
+        legacy.executescript(MIGRATION.read_text(encoding='utf-8'))
+        legacy.execute('''INSERT INTO audit_log(id,entity_type,entity_id,action,before_json,after_json,occurred_at_utc)
+            VALUES ('legacy-log-1','item','item-1','update','{"name":"قبل"}','{"name":"بعد"}',?)''', (NOW,))
+        legacy.commit()
+        legacy.executescript(AUDIT_MIGRATION.read_text(encoding='utf-8'))
+        saved = legacy.execute("SELECT action,before_json,after_json FROM audit_log WHERE id='legacy-log-1'").fetchone()
+        self.assertEqual(saved['action'], 'update')
+        self.assertEqual(saved['before_json'], '{"name":"قبل"}')
+        self.assertEqual(saved['after_json'], '{"name":"بعد"}')
+        legacy.execute('''INSERT INTO audit_log(id,entity_type,entity_id,action,after_json,occurred_at_utc)
+            VALUES ('new-report-log','system','report-1','report_export','{"fileName":"test.pdf"}',?)''', (NOW,))
+        with self.assertRaises(sqlite3.IntegrityError):
+            legacy.execute("UPDATE audit_log SET action='create' WHERE id='legacy-log-1'")
+        with self.assertRaises(sqlite3.IntegrityError):
+            legacy.execute("DELETE FROM audit_log WHERE id='legacy-log-1'")
+        self.assertEqual(legacy.execute('SELECT COUNT(*) FROM audit_log').fetchone()[0], 2)
+        legacy.close()
 
 
 if __name__ == '__main__':

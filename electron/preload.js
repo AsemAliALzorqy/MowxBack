@@ -8,6 +8,11 @@ contextBridge.exposeInMainWorld('mowx', Object.freeze({
   getDatabaseStatus: () => ipcRenderer.invoke('mowx:database-status'),
   getSnapshot: () => ipcRenderer.invoke('mowx:get-snapshot'),
   getReport: (range) => ipcRenderer.invoke('mowx:get-report', range),
+  getReportOptions: () => ipcRenderer.invoke('mowx:get-report-options'),
+  getCustomReportData: (payload) => ipcRenderer.invoke('mowx:get-custom-report-data', payload),
+  exportCustomReportPdf: (payload) => ipcRenderer.invoke('mowx:export-custom-report-pdf', payload),
+  getAuditLog: (payload) => ipcRenderer.invoke('mowx:get-audit-log', payload),
+  recordApplicationError: (payload) => ipcRenderer.invoke('mowx:record-application-error', payload),
   searchNameSuggestions: (query) => ipcRenderer.invoke('mowx:search-name-suggestions', { query }),
 
   createProfitMovement: (payload) => ipcRenderer.invoke('mowx:create-profit-movement', payload),

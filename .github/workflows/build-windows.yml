@@ -9,6 +9,7 @@ on:
       - 'css/**'
       - 'js/**'
       - 'electron/**'
+      - 'reports/**'
       - 'src/**'
       - 'database/**'
       - 'docs/**'

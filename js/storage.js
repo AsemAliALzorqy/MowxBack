@@ -5,6 +5,11 @@
 const Store = Object.freeze({
   load: () => window.mowx.getSnapshot(),
   report: (fromDate, toDate) => window.mowx.getReport({ fromDate, toDate }),
+  reportOptions: () => window.mowx.getReportOptions(),
+  customReport: (payload) => window.mowx.getCustomReportData(payload),
+  exportReportPdf: (payload) => window.mowx.exportCustomReportPdf(payload),
+  auditLog: (payload) => window.mowx.getAuditLog(payload),
+  logApplicationError: (payload) => window.mowx.recordApplicationError(payload),
   saveProfit: (payload) => window.mowx.createProfitMovement(payload),
   updateProfitLine: (payload) => window.mowx.updateProfitLine(payload),
   deleteProfitLine: (payload) => window.mowx.deleteProfitLine(payload),

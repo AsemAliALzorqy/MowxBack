@@ -125,7 +125,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     parent_entity_id  TEXT,
     action            TEXT NOT NULL CHECK (action IN (
         'create', 'update', 'soft_delete', 'restore', 'activate', 'deactivate',
-        'import', 'backup_restore', 'database_move', 'reset'
+        'import', 'backup_restore', 'database_move', 'reset', 'report_export', 'application_error'
     )),
     before_json       TEXT CHECK (before_json IS NULL OR json_valid(before_json)),
     after_json        TEXT CHECK (after_json IS NULL OR json_valid(after_json)),
@@ -280,3 +280,16 @@ VALUES
     ('currencyDecimalPlaces', '2', strftime('%Y-%m-%dT%H:%M:%fZ','now'));
 
 PRAGMA user_version = 1;
+
+-- Audit history is append-only. See migration 002 for existing installations.
+CREATE TRIGGER IF NOT EXISTS trg_audit_log_no_update
+BEFORE UPDATE ON audit_log
+BEGIN
+    SELECT RAISE(ABORT, 'audit_log is append-only: UPDATE is not permitted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_audit_log_no_delete
+BEFORE DELETE ON audit_log
+BEGIN
+    SELECT RAISE(ABORT, 'audit_log is append-only: DELETE is not permitted');
+END;

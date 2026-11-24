@@ -25,6 +25,31 @@ let dbPath = null;
 let runtimeConfig = null;
 let isQuitting = false;
 
+async function renderReportPdf(reportData) {
+  const pdfWindow = new BrowserWindow({
+    show: false,
+    width: 1000,
+    height: 1400,
+    autoHideMenuBar: true,
+    webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+  });
+  try {
+    await pdfWindow.loadFile(path.join(__dirname, '..', 'reports', 'templates', 'report.html'));
+    await pdfWindow.webContents.executeJavaScript(`window.renderMowxReport(${JSON.stringify(reportData)}).then(() => true)`);
+    return await pdfWindow.webContents.printToPDF({
+      pageSize: 'A4',
+      printBackground: true,
+      preferCSSPageSize: true,
+      displayHeaderFooter: true,
+      margins: { top: 0.35, right: 0.35, bottom: 0.55, left: 0.35 },
+      headerTemplate: '<div></div>',
+      footerTemplate: `<div style="width:100%;font-family:Arial,sans-serif;font-size:8px;color:#64748b;padding:0 12mm;display:flex;justify-content:space-between;"><span>MowxBack</span><span><span class="pageNumber"></span> / <span class="totalPages"></span></span></div>`,
+    });
+  } finally {
+    if (!pdfWindow.isDestroyed()) pdfWindow.destroy();
+  }
+}
+
 const APP_CONFIG_NAME = 'mowxback-runtime.json';
 
 function configPath() {
@@ -230,6 +255,7 @@ function registerIpc() {
       tx: Repository.listAllTransactions(db),
       names: Repository.listNameSuggestionHistory(db).map((row) => row.display_name),
       log: Repository.listAuditLog(db, 200),
+      auditLogCount: Repository.listAuditLogPage(db, { limit: 1, offset: 0 }).total,
       runtime: status,
     };
   }
@@ -317,6 +343,145 @@ function registerIpc() {
       transactions: result.transactions,
     };
   });
+  registerIpcHandler('mowx:get-report-options', () => Repository.listReportOptions(db));
+
+  function prepareReportData(payload) {
+    requiredObject(payload, 'Report request');
+    const type = stringValue(payload.type, 'Report type', 20);
+    if (!['general', 'profits', 'expenses', 'withdrawals'].includes(type)) throw new TypeError('نوع التقرير غير مدعوم.');
+    const fromDate = stringValue(payload.fromDate, 'Report start date', 10);
+    const toDate = stringValue(payload.toDate, 'Report end date', 10);
+    const scaled = (value, scale, label) => {
+      const integer = BigInt(value || '0');
+      if (integer > BigInt(Number.MAX_SAFE_INTEGER) || integer < BigInt(Number.MIN_SAFE_INTEGER)) {
+        throw new RangeError(`${label} exceeds the safe display range. Narrow the report period.`);
+      }
+      return Number(integer) / scale;
+    };
+    const milli = (value) => scaled(value, 1000, 'Report amounts');
+    const micros = (value) => scaled(value, 1000000, 'Report quantities');
+    const settings = currencySettings();
+    const base = {
+      type, fromDate, toDate,
+      title: ({ general: 'التقرير العام', profits: 'تقرير أرباح الأصناف', expenses: 'تقرير المصروفات', withdrawals: 'تقرير سحبيات العمال' })[type],
+      generatedAt: new Date().toISOString(),
+      generatedAtText: new Intl.DateTimeFormat('ar-JO', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date()),
+      currency: { code: settings.currencyCode, label: settings.currency, decimalPlaces: settings.currencyDecimalPlaces },
+      filterSummary: type === 'general' ? 'جميع الحركات المالية المسجلة' : '',
+    };
+    if (type === 'general') {
+      const result = Repository.getGeneralReport(db, fromDate, toDate);
+      return {
+        ...base,
+        totals: {
+          profit: milli(result.totals.profit_milli), expenses: milli(result.totals.expense_milli),
+          withdrawals: milli(result.totals.withdrawal_milli), totalExpenses: milli(result.totals.total_expense_milli),
+          net: milli(result.totals.net_milli), quantity: micros(result.totals.quantity_micros),
+        },
+        daily: result.daily.map((row) => ({
+          date: row.date, profit: milli(row.profit_milli), expenses: milli(row.expense_milli),
+          withdrawals: milli(row.withdrawal_milli), net: milli(row.net_milli), quantity: micros(row.quantity_micros),
+        })),
+        items: result.items.map((row) => ({ name: row.item_name, qty: micros(row.quantity_micros), amount: milli(row.amount_milli) })),
+        categories: result.categories.map((row) => ({ name: row.name, amount: milli(row.amount_milli) })),
+        workers: result.workers.map((row) => ({ name: row.name, amount: milli(row.amount_milli) })),
+        movements: result.transactions.flatMap((transaction) => {
+          if (transaction.type === 'profit') {
+            return (transaction.lines || []).map((line) => ({
+              type: 'profit', date: transaction.date, party: line.name,
+              quantity: line.qty, amount: line.amount, description: '', notes: line.note || '',
+            }));
+          }
+          return [{
+            type: transaction.type, date: transaction.date,
+            party: transaction.name, quantity: null, amount: transaction.amount,
+            description: transaction.desc || '', notes: transaction.note || '',
+          }];
+        }),
+      };
+    }
+    if (type === 'profits') {
+      const selected = Array.isArray(payload.itemNames) ? payload.itemNames.map((v) => stringValue(v, 'Item name', 300)) : [];
+      const result = Repository.getProfitItemReport(db, fromDate, toDate, selected);
+      return {
+        ...base,
+        filterSummary: `الأصناف المختارة: ${result.selected.join('، ')}`,
+        selected: result.selected,
+        totals: { amount: milli(result.totals.amount_milli), quantity: micros(result.totals.quantity_micros), operationCount: result.totals.operation_count },
+        byItem: result.byItem.map((row) => ({ name: row.name, amount: milli(row.amount_milli), quantity: micros(row.quantity_micros), operationCount: row.operation_count })),
+        byDay: result.byDay.map((row) => ({ date: row.date, amount: milli(row.amount_milli), quantity: micros(row.quantity_micros), operationCount: row.operation_count })),
+        rows: result.rows.map((row) => ({ date: row.tx_date, itemName: row.item_name, quantity: micros(row.quantity_micros), amount: milli(row.amount_milli), notes: row.notes || '', transactionId: row.transaction_id, lineId: row.line_id })),
+      };
+    }
+    if (type === 'expenses') {
+      const selected = Array.isArray(payload.categoryIds) ? payload.categoryIds.map((v) => stringValue(v, 'Category ID', 160)) : [];
+      if (payload.allCategories === false && selected.length === 0) throw new Error('Select at least one expense category or enable all categories.');
+      const result = Repository.getExpenseCategoryReport(db, fromDate, toDate, selected);
+      const categoryOptions = Repository.listReportOptions(db).categories;
+      const categoryNames = payload.allCategories === false
+        ? categoryOptions.filter((entry) => selected.includes(entry.value)).map((entry) => entry.name)
+        : ['جميع الفئات'];
+      return {
+        ...base, filterSummary: `الفئات: ${categoryNames.join('، ') || 'فئات محددة'}`, selected: result.selected,
+        totals: { amount: milli(result.totals.amount_milli), operationCount: result.totals.operation_count },
+        byCategory: result.byCategory.map((row) => ({ id: row.id, name: row.name, amount: milli(row.amount_milli), operationCount: row.operation_count })),
+        rows: result.rows.map((row) => ({ date: row.tx_date, category: row.category_name_snapshot, amount: milli(row.amount_milli), description: row.description || '', notes: row.notes || '', id: row.id })),
+      };
+    }
+    const selected = Array.isArray(payload.workerIds) ? payload.workerIds.map((v) => stringValue(v, 'Worker ID', 160)) : [];
+    if (payload.allWorkers === false && selected.length === 0) throw new Error('Select at least one worker or enable all workers.');
+    const result = Repository.getWorkerWithdrawalReport(db, fromDate, toDate, selected);
+    const workerOptions = Repository.listReportOptions(db).workers;
+    const workerNames = payload.allWorkers === false
+      ? workerOptions.filter((entry) => selected.includes(entry.value)).map((entry) => entry.name)
+      : ['جميع العمال'];
+    return {
+      ...base, filterSummary: `العمال: ${workerNames.join('، ') || 'عمال محددون'}`, selected: result.selected,
+      totals: { amount: milli(result.totals.amount_milli), operationCount: result.totals.operation_count },
+      byWorker: result.byWorker.map((row) => ({ id: row.id, name: row.name, amount: milli(row.amount_milli), operationCount: row.operation_count })),
+      rows: result.rows.map((row) => ({ date: row.tx_date, worker: row.worker_name_snapshot, amount: milli(row.amount_milli), notes: row.notes || '', id: row.id })),
+    };
+  }
+
+  registerIpcHandler('mowx:get-custom-report-data', (payload) => prepareReportData(payload));
+  registerIpcHandler('mowx:export-custom-report-pdf', async (payload) => {
+    const report = prepareReportData(payload);
+    const fromStamp = report.fromDate;
+    const toStamp = report.toDate;
+    const suffix = fromStamp === toStamp ? fromStamp : `${fromStamp}_${toStamp}`;
+    const filename = `MowxBack_${report.title.replace(/\s+/g, '_')}_${suffix}.pdf`;
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'حفظ تقرير MowxBack بصيغة PDF',
+      defaultPath: filename,
+      filters: [{ name: 'PDF', extensions: ['pdf'] }],
+    });
+    if (result.canceled || !result.filePath) return { canceled: true };
+    const pdf = await renderReportPdf(report);
+    await fs.writeFile(result.filePath, pdf);
+    Repository.recordSystemEvent(db, 'report_export', {
+      reportType: report.type, title: report.title, fromDate: report.fromDate,
+      toDate: report.toDate, fileName: path.basename(result.filePath), bytes: pdf.length,
+    });
+    return { canceled: false, path: result.filePath, bytes: pdf.length };
+  });
+  registerIpcHandler('mowx:get-audit-log', (payload) => {
+    const source = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
+    const limit = source.limit === undefined ? 100 : source.limit;
+    const offset = source.offset === undefined ? 0 : source.offset;
+    if (!Number.isInteger(limit) || !Number.isInteger(offset)) throw new TypeError('Audit log paging values must be integers.');
+    const search = source.search === undefined ? '' : stringValue(source.search, 'Audit log search', 200);
+    return Repository.listAuditLogPage(db, { limit, offset, search });
+  });
+
+  registerIpcHandler('mowx:record-application-error', (payload) => {
+    requiredObject(payload, 'Application error');
+    const screen = stringValue(payload.screen || 'غير معروف', 'Error screen', 80);
+    const message = stringValue(payload.message || 'خطأ غير محدد', 'Error message', 1500);
+    const stack = payload.stack === undefined ? '' : stringValue(payload.stack, 'Error stack', 8000);
+    const source = payload.source === undefined ? 'renderer' : stringValue(payload.source, 'Error source', 40);
+    return Repository.recordSystemEvent(db, 'application_error', { screen, message, stack, source });
+  });
+
   registerIpcHandler('mowx:search-name-suggestions', (payload) => {
     requiredObject(payload, 'Name search');
     return Repository.searchNameSuggestions(db, stringValue(payload.query, 'Search query', 200), 8);
@@ -558,6 +723,27 @@ function registerIpc() {
     return { canceled: false, ...summary };
   });
 }
+
+function recordMainProcessError(source, reason) {
+  const error = reason instanceof Error ? reason : new Error(String(reason));
+  const details = {
+    screen: 'العملية الرئيسية', message: String(error.message || error).slice(0, 1500),
+    stack: String(error.stack || '').slice(0, 8000), source,
+  };
+  try {
+    if (db) Repository.recordSystemEvent(db, 'application_error', details);
+  } catch (logError) {
+    console.error('تعذر حفظ سجل خطأ العملية الرئيسية:', logError);
+  }
+  console.error(`[MowxBack ${source}]`, error);
+}
+
+process.on('unhandledRejection', (reason) => recordMainProcessError('main-unhandled-rejection', reason));
+process.once('uncaughtException', (error) => {
+  recordMainProcessError('main-uncaught-exception', error);
+  try { dialog.showErrorBox('توقف غير متوقع في MowxBack', String(error?.message || error)); } catch (_) { /* app may not be ready */ }
+  app.quit();
+});
 
 app.whenReady().then(async () => {
   try {

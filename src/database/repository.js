@@ -31,6 +31,13 @@ function audit(db, { entityType, entityId, parentEntityId = null, action, before
       after === null ? null : JSON.stringify(after), at);
 }
 
+function recordSystemEvent(db, action, details, at = utcNow()) {
+  if (!['report_export', 'application_error'].includes(action)) throw new Error('Unsupported system audit action.');
+  const id = makeId('system-event');
+  audit(db, { entityType: 'system', entityId: id, action, after: details || {}, at });
+  return id;
+}
+
 function addSuggestion(db, rawName, at = utcNow()) {
   const display = normalizeName(rawName);
   const key = normalizeKey(display);
@@ -685,6 +692,182 @@ function listTransactionsForLegacyExport(db) {
   return exported.sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
 }
 
+function validateReportRange(fromDate, toDate) {
+  assertValidDate(fromDate);
+  assertValidDate(toDate);
+  if (fromDate > toDate) throw new Error('Start date cannot be after end date.');
+}
+
+function reportInteger(value) {
+  return String(value ?? '0');
+}
+
+function sumIntegerStrings(values) {
+  return values.reduce((total, value) => total + BigInt(value || 0), 0n).toString();
+}
+
+function listReportOptions(db) {
+  const catalogItems = db.prepare(`SELECT name, is_active FROM items
+    WHERE deleted_at IS NULL ORDER BY name COLLATE NOCASE`).all();
+  const historicalItems = db.prepare(`SELECT pl.item_name AS name, 0 AS is_active FROM profit_lines pl
+    JOIN profit_transactions pt ON pt.id=pl.transaction_id
+    WHERE pl.deleted_at IS NULL AND pt.deleted_at IS NULL
+    GROUP BY pl.item_name ORDER BY pl.item_name COLLATE NOCASE`).all();
+  const itemMap = new Map();
+  for (const row of [...catalogItems, ...historicalItems]) {
+    const key = String(row.name || '').trim();
+    if (!key) continue;
+    const existing = itemMap.get(key);
+    itemMap.set(key, { value: key, name: key, active: Boolean(row.is_active) || Boolean(existing?.active) });
+  }
+  const categories = db.prepare(`SELECT id AS value, name, is_active AS active
+    FROM expense_categories WHERE deleted_at IS NULL ORDER BY name COLLATE NOCASE, id`).all()
+    .map((row) => ({ ...row, active: Boolean(row.active) }));
+  const workers = db.prepare(`SELECT id AS value, name, is_active AS active
+    FROM workers WHERE deleted_at IS NULL ORDER BY name COLLATE NOCASE, id`).all()
+    .map((row) => ({ ...row, active: Boolean(row.active) }));
+  return {
+    items: [...itemMap.values()].sort((a, b) => a.name.localeCompare(b.name, 'ar')),
+    categories,
+    workers,
+  };
+}
+
+function getProfitItemReport(db, fromDate, toDate, itemNames) {
+  validateReportRange(fromDate, toDate);
+  if (!Array.isArray(itemNames) || itemNames.length < 1 || itemNames.length > 100) {
+    throw new Error('Select one or more items for the profit report.');
+  }
+  const names = [...new Set(itemNames.map((name) => normalizeName(name)).filter(Boolean))];
+  if (!names.length) throw new Error('Select one or more items for the profit report.');
+  const placeholders = names.map(() => '?').join(',');
+  const rows = db.prepare(`SELECT pl.id AS line_id, pl.transaction_id, pt.tx_date,
+      pl.item_name, CAST(pl.quantity_micros AS TEXT) AS quantity_micros,
+      CAST(pl.amount_milli AS TEXT) AS amount_milli, pl.notes
+    FROM profit_lines pl JOIN profit_transactions pt ON pt.id=pl.transaction_id
+    WHERE pt.deleted_at IS NULL AND pl.deleted_at IS NULL
+      AND pt.tx_date BETWEEN ? AND ? AND pl.item_name IN (${placeholders})
+    ORDER BY pt.tx_date, pl.item_name COLLATE NOCASE, pl.rowid`).all(fromDate, toDate, ...names);
+  const byItemMap = new Map();
+  const byDayMap = new Map();
+  for (const row of rows) {
+    const item = byItemMap.get(row.item_name) || { name: row.item_name, quantity_micros: '0', amount_milli: '0', operation_count: 0 };
+    item.quantity_micros = (BigInt(item.quantity_micros) + BigInt(row.quantity_micros)).toString();
+    item.amount_milli = (BigInt(item.amount_milli) + BigInt(row.amount_milli)).toString();
+    item.operation_count += 1;
+    byItemMap.set(row.item_name, item);
+    const day = byDayMap.get(row.tx_date) || { date: row.tx_date, quantity_micros: '0', amount_milli: '0', operation_count: 0 };
+    day.quantity_micros = (BigInt(day.quantity_micros) + BigInt(row.quantity_micros)).toString();
+    day.amount_milli = (BigInt(day.amount_milli) + BigInt(row.amount_milli)).toString();
+    day.operation_count += 1;
+    byDayMap.set(row.tx_date, day);
+  }
+  return {
+    type: 'profits', fromDate, toDate, selected: names,
+    totals: {
+      quantity_micros: sumIntegerStrings(rows.map((row) => row.quantity_micros)),
+      amount_milli: sumIntegerStrings(rows.map((row) => row.amount_milli)),
+      operation_count: rows.length,
+    },
+    rows: rows.map((row) => ({ ...row })),
+    byItem: [...byItemMap.values()].sort((a, b) => a.name.localeCompare(b.name, 'ar')),
+    byDay: [...byDayMap.values()].sort((a, b) => a.date.localeCompare(b.date)),
+  };
+}
+
+function getExpenseCategoryReport(db, fromDate, toDate, categoryIds = []) {
+  validateReportRange(fromDate, toDate);
+  if (!Array.isArray(categoryIds) || categoryIds.length > 100) throw new Error('Invalid expense category selection.');
+  const ids = [...new Set(categoryIds.map(String).filter(Boolean))];
+  const filter = ids.length ? `AND category_id IN (${ids.map(() => '?').join(',')})` : '';
+  const rows = db.prepare(`SELECT id, tx_date, category_id, category_name_snapshot,
+      CAST(amount_milli AS TEXT) AS amount_milli, description, notes
+    FROM expenses WHERE deleted_at IS NULL AND tx_date BETWEEN ? AND ? ${filter}
+    ORDER BY tx_date, category_name_snapshot COLLATE NOCASE, id`).all(fromDate, toDate, ...ids);
+  const group = new Map();
+  for (const row of rows) {
+    const key = `${row.category_id}::${row.category_name_snapshot}`;
+    const current = group.get(key) || { id: row.category_id, name: row.category_name_snapshot, amount_milli: '0', operation_count: 0 };
+    current.amount_milli = (BigInt(current.amount_milli) + BigInt(row.amount_milli)).toString();
+    current.operation_count += 1;
+    group.set(key, current);
+  }
+  return {
+    type: 'expenses', fromDate, toDate, selected: ids,
+    totals: { amount_milli: sumIntegerStrings(rows.map((row) => row.amount_milli)), operation_count: rows.length },
+    rows, byCategory: [...group.values()].sort((a, b) => a.name.localeCompare(b.name, 'ar')),
+  };
+}
+
+function getWorkerWithdrawalReport(db, fromDate, toDate, workerIds = []) {
+  validateReportRange(fromDate, toDate);
+  if (!Array.isArray(workerIds) || workerIds.length > 100) throw new Error('Invalid worker selection.');
+  const ids = [...new Set(workerIds.map(String).filter(Boolean))];
+  const filter = ids.length ? `AND worker_id IN (${ids.map(() => '?').join(',')})` : '';
+  const rows = db.prepare(`SELECT id, tx_date, worker_id, worker_name_snapshot,
+      CAST(amount_milli AS TEXT) AS amount_milli, notes
+    FROM withdrawals WHERE deleted_at IS NULL AND tx_date BETWEEN ? AND ? ${filter}
+    ORDER BY tx_date, worker_name_snapshot COLLATE NOCASE, id`).all(fromDate, toDate, ...ids);
+  const group = new Map();
+  for (const row of rows) {
+    const key = `${row.worker_id}::${row.worker_name_snapshot}`;
+    const current = group.get(key) || { id: row.worker_id, name: row.worker_name_snapshot, amount_milli: '0', operation_count: 0 };
+    current.amount_milli = (BigInt(current.amount_milli) + BigInt(row.amount_milli)).toString();
+    current.operation_count += 1;
+    group.set(key, current);
+  }
+  return {
+    type: 'withdrawals', fromDate, toDate, selected: ids,
+    totals: { amount_milli: sumIntegerStrings(rows.map((row) => row.amount_milli)), operation_count: rows.length },
+    rows, byWorker: [...group.values()].sort((a, b) => a.name.localeCompare(b.name, 'ar')),
+  };
+}
+
+function getGeneralReport(db, fromDate, toDate) {
+  validateReportRange(fromDate, toDate);
+  const base = getReportData(db, fromDate, toDate);
+  const dailyRows = getDailyTotals(db, fromDate, toDate);
+  const dailyMap = new Map(dailyRows.map((row) => [row.tx_date, row]));
+  const daily = [];
+  const cursor = new Date(`${fromDate}T00:00:00.000Z`);
+  const end = new Date(`${toDate}T00:00:00.000Z`);
+  for (let guard = 0; cursor <= end && guard < 3661; guard += 1) {
+    const date = cursor.toISOString().slice(0, 10);
+    const row = dailyMap.get(date) || {};
+    daily.push({
+      date,
+      profit_milli: reportInteger(row.profit_milli),
+      expense_milli: reportInteger(row.expense_milli),
+      withdrawal_milli: reportInteger(row.withdrawal_milli),
+      total_expense_milli: reportInteger(row.total_expense_milli),
+      net_milli: reportInteger(row.net_milli),
+      quantity_micros: reportInteger(row.profit_quantity_micros),
+    });
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  if (daily.length >= 3661 && daily[daily.length - 1].date < toDate) {
+    throw new RangeError('The selected report range is too long. Select a period of 10 years or less.');
+  }
+  return { type: 'general', fromDate, toDate, totals: base.totals, daily,
+    items: base.items, categories: base.categories, workers: base.workers, transactions: base.transactions };
+}
+
+function listAuditLogPage(db, { limit = 50, offset = 0, search = '' } = {}) {
+  const safeLimit = Math.min(Math.max(Number.isInteger(limit) ? limit : 50, 1), 200);
+  const safeOffset = Math.min(Math.max(Number.isInteger(offset) ? offset : 0, 0), 10000000);
+  const query = String(search || '').trim().slice(0, 200);
+  const like = `%${query.replace(/[\\%_]/g, (value) => `\\${value}`)}%`;
+  const where = query ? `WHERE entity_type LIKE ? ESCAPE '\\' OR entity_id LIKE ? ESCAPE '\\'
+    OR action LIKE ? ESCAPE '\\' OR COALESCE(before_json,'') LIKE ? ESCAPE '\\'
+    OR COALESCE(after_json,'') LIKE ? ESCAPE '\\'` : '';
+  const args = query ? [like, like, like, like, like] : [];
+  const rows = db.prepare(`SELECT id, entity_type, entity_id, parent_entity_id, action,
+      before_json, after_json, occurred_at_utc FROM audit_log ${where}
+      ORDER BY occurred_at_utc DESC, rowid DESC LIMIT ? OFFSET ?`).all(...args, safeLimit, safeOffset);
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM audit_log ${where}`).get(...args).n;
+  return { items: mapAuditRows(rows), total, limit: safeLimit, offset: safeOffset, hasMore: safeOffset + rows.length < total };
+}
+
 module.exports = {
   createProfitMovement,
   updateProfitLine,
@@ -715,5 +898,12 @@ module.exports = {
   listAllAuditLog,
   listAllTransactions,
   getReportData,
+  listReportOptions,
+  getProfitItemReport,
+  getExpenseCategoryReport,
+  getWorkerWithdrawalReport,
+  getGeneralReport,
+  listAuditLogPage,
+  recordSystemEvent,
   listTransactionsForLegacyExport,
 };

@@ -59,6 +59,8 @@ function run() {
       { id: 'line-test-2', name: 'صنف باء', quantityMicros: 2000000, amountMilli: 7000, notes: '' },
     ],
   });
+  const catalogItem = repository.saveCatalogEntry(database, 'item', { id: 'item-catalog-1', name: 'صنف إداري' });
+  assert.equal(catalogItem.name, 'صنف إداري');
   assert.equal(movement.amountMilli, 19500);
   assert.equal(movement.quantityMicros, 3250000);
 
@@ -80,6 +82,45 @@ function run() {
     id: 'withdrawal-test-1', date: '2026-11-23', workerId: worker.id,
     amountMilli: 2000, notes: 'دفعة',
   });
+
+  // Dynamic report options include catalog items and names captured in live profit lines.
+  const reportOptions = repository.listReportOptions(database);
+  assert.ok(reportOptions.items.some((entry) => entry.name === 'صنف إداري'));
+  assert.ok(reportOptions.items.some((entry) => entry.name === 'صنف ألف معدل'));
+  assert.equal(reportOptions.items.some((entry) => entry.name === 'صنف باء'), false, 'Deleted profit lines are excluded from live report options.');
+  assert.ok(reportOptions.categories.some((entry) => entry.value === category.id));
+  assert.ok(reportOptions.workers.some((entry) => entry.value === worker.id));
+
+  const itemReport = repository.getProfitItemReport(database, '2026-11-23', '2026-11-23', ['صنف ألف معدل']);
+  assert.equal(itemReport.rows.length, 1);
+  assert.equal(itemReport.totals.amount_milli, '15000');
+  assert.equal(itemReport.totals.quantity_micros, '1500000');
+  assert.throws(() => repository.getProfitItemReport(database, '2026-11-23', '2026-11-23', []), /Select one or more items/);
+
+  const expenseReport = repository.getExpenseCategoryReport(database, '2026-11-23', '2026-11-23', [category.id]);
+  assert.equal(expenseReport.rows.length, 1);
+  assert.equal(expenseReport.totals.amount_milli, '8000');
+  const withdrawalReport = repository.getWorkerWithdrawalReport(database, '2026-11-23', '2026-11-23', [worker.id]);
+  assert.equal(withdrawalReport.rows.length, 1);
+  assert.equal(withdrawalReport.totals.amount_milli, '2000');
+
+  const generalReport = repository.getGeneralReport(database, '2026-11-22', '2026-11-24');
+  assert.equal(generalReport.daily.length, 3);
+  assert.equal(generalReport.daily[0].profit_milli, '0');
+  assert.equal(generalReport.daily[1].profit_milli, '15000');
+  assert.equal(generalReport.daily[2].net_milli, '0');
+  assert.equal(generalReport.totals.net_milli, '5000');
+  assert.equal(generalReport.transactions.length, 3);
+  assert.equal(generalReport.transactions.find((entry) => entry.type === 'profit').lines.length, 1);
+  assert.equal(generalReport.transactions.find((entry) => entry.type === 'expense').desc, 'وقود');
+  assert.equal(generalReport.transactions.find((entry) => entry.type === 'withdrawal').name, 'عامل الاختبار');
+  assert.equal(generalReport.daily.reduce((sum, row) => sum + BigInt(row.net_milli), 0n).toString(), generalReport.totals.net_milli);
+
+  repository.recordSystemEvent(database, 'report_export', { reportType: 'profits', fileName: 'test.pdf' });
+  repository.recordSystemEvent(database, 'application_error', { screen: 'reports', message: 'خطأ اختباري' });
+  assert.throws(() => database.prepare("UPDATE audit_log SET action='update' WHERE entity_type='system'").run(), /append-only/);
+  assert.throws(() => database.prepare("DELETE FROM audit_log WHERE entity_type='system'").run(), /append-only/);
+  assert.equal(repository.listAuditLogPage(database, { limit: 20, offset: 0, search: 'test.pdf' }).items.length, 1);
 
   let report = repository.getReportData(database, '2026-11-23', '2026-11-23');
   assert.equal(Number(report.totals.profit_milli), 15000);
@@ -209,7 +250,7 @@ function run() {
   } finally {
     fs.rmSync(tempDirectory, { recursive: true, force: true });
   }
-  console.log('Repository/import integration: 50 assertions passed (including full audit export and file close/reopen).');
+  console.log('Repository/report/audit integration: report selection, totals, daily reconciliation, append-only audit, legacy import/export, and persistence checks passed.');
 }
 
 try { run(); }

@@ -261,7 +261,7 @@ function importLegacyBackup(db, rawText, sourceName = '') {
       const entityType = allowedEntityTypes.has(entry.entityType) ? entry.entityType : inferredEntityType;
       const entityId = String(entry.entityId || entry.lineId || entry.txId || id);
       const parentEntityId = entry.parentEntityId || entry.txId || null;
-      const allowedActions = new Set(['create', 'update', 'soft_delete', 'restore', 'activate', 'deactivate', 'backup_restore', 'database_move', 'import']);
+      const allowedActions = new Set(['create', 'update', 'soft_delete', 'restore', 'activate', 'deactivate', 'backup_restore', 'database_move', 'import', 'report_export', 'application_error']);
       const op = allowedActions.has(entry.op) ? entry.op
         : entry.op === 'delete' ? 'soft_delete' : 'update';
       insertAudit.run(

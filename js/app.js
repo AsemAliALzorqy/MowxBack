@@ -21,6 +21,16 @@ let rng = { from: `${todayStr().slice(0, 8)}01`, to: todayStr() };
 let rep = { kind: 'month', day: todayStr(), from: rng.from, to: rng.to, cur: null };
 let q = '';
 let renderSequence = 0;
+const reportUi = {
+  type: 'general', period: 'month', day: todayStr(), month: todayStr().slice(0, 7),
+  from: `${todayStr().slice(0, 8)}01`, to: todayStr(),
+  itemNames: [], categoryIds: [], workerIds: [], allCategories: true, allWorkers: true, preview: null,
+};
+let reportOptionsData = null;
+let auditQuery = '';
+let auditLoading = false;
+let auditSearchTimer = null;
+let auditSearchSequence = 0;
 
 const fmtNum = (n, max = 3) => new Intl.NumberFormat('en-US', { maximumFractionDigits: max }).format(Number(n) || 0);
 const normName = (name) => String(name || '').replace(/\s+/g, ' ').trim();
@@ -99,13 +109,31 @@ const V = {
     return `${dateBar(`<button class="btn p" data-act="add" data-type="${type}" data-date="${todayStr()}">${ic('plus')} إضافة</button>`)}<div class="card" style="margin-bottom:12px"><div class="k">المجموع${type === 'profit' ? ` — الكمية <span class="num">${fmtNum(s.qty)}</span>` : ''}</div><div class="v ${TYPE[type][2]}">${money(total)}</div>${type === 'withdrawal' ? '<div class="sub">تُحتسب ضمن المصروفات مرة واحدة</div>' : ''}</div><div class="card">${list(entries.slice().sort((a, b) => b.date.localeCompare(a.date)))}</div>${by}`;
   },
   reports() {
-    const data = rep.cur;
-    if (!data) return '<div class="empty">جارٍ تحميل التقرير من قاعدة البيانات...</div>';
-    const s = data.totals;
-    const l = data.transactions;
-    const tb = (rows, renderRow) => rows.length ? `<table>${rows.map(renderRow).join('')}</table>` : '<div class="empty">لا توجد بيانات</div>';
-    const period = `الفترة: <span class="num">${data.from}</span> إلى <span class="num">${data.to}</span>`;
-    return `<div class="bar"><label class="fld">نوع التقرير<select id="repKind"><option value="day"${rep.kind === 'day' ? ' selected' : ''}>يومي</option><option value="month"${rep.kind === 'month' ? ' selected' : ''}>شهري</option><option value="range"${rep.kind === 'range' ? ' selected' : ''}>من تاريخ إلى تاريخ</option></select></label>${rep.kind === 'range' ? `<label class="fld">من<input type="date" data-rep="from" value="${rep.from}"></label><label class="fld">إلى<input type="date" data-rep="to" value="${rep.to}"></label>` : `<label class="fld">التاريخ<input type="date" data-rep="day" value="${rep.day}"></label>`}</div><div class="bar"><button class="btn" data-act="pdf">${ic('download')} تصدير PDF (طباعة)</button><button class="btn" data-act="xls">${ic('download')} تصدير Excel (CSV)</button></div><div class="sub">${period}</div><div style="height:8px"></div>${netCard(s)}<h2>أرباح الأصناف</h2><div class="card scroll">${tb(data.items, (v) => `<tr><td>${esc(v.name)}</td><td><span class="num">${fmtNum(v.qty)}</span></td><td>${money(v.amount)}</td></tr>`)}<div class="row"><b class="m">إجمالي الأرباح (الكمية <span class="num">${fmtNum(s.qty)}</span>)</b><b class="gain">${money(s.profit)}</b></div></div><h2>المصروفات حسب التصنيف</h2><div class="card scroll">${tb(data.categories, (v) => `<tr><td>${esc(v.name)}</td><td>${money(v.amount)}</td></tr>`)}</div><h2>سحبيات العمال (تفصيل ضمن المصروفات)</h2><div class="card scroll">${tb(data.workers, (v) => `<tr><td>${esc(v.name)}</td><td>${money(v.amount)}</td></tr>`)}</div><h2>تفاصيل العمليات</h2><div class="card">${list(l)}</div><div class="card" style="margin-top:12px"><div class="row"><span class="m">مصروفات التصنيفات</span>${money(s.exp)}</div><div class="row"><span class="m">سحبيات العمال</span>${money(s.wd)}</div><div class="row"><b class="m">إجمالي المصروفات</b><b class="loss">${money(s.totalExp)}</b></div></div>`;
+    const options = reportOptionsData || { items: [], categories: [], workers: [] };
+    const types = [
+      ['withdrawals', 'سحبيات العمال', 'wallet', 'تفاصيل السحبيات وإجمالي كل عامل'],
+      ['expenses', 'المصروفات', 'receipt', 'تحليل المصروفات حسب الفئات المختارة'],
+      ['profits', 'أرباح الأصناف', 'up', 'حركات وأرباح صنف واحد أو عدة أصناف'],
+      ['general', 'التقرير العام', 'chart', 'ملخص يومي للأرباح والمصروفات والسحبيات'],
+    ];
+    const selected = reportUi.type === 'profits' ? reportUi.itemNames
+      : reportUi.type === 'expenses' ? reportUi.categoryIds : reportUi.workerIds;
+    const optionList = reportUi.type === 'profits' ? options.items
+      : reportUi.type === 'expenses' ? options.categories : options.workers;
+    const filterKey = reportUi.type === 'profits' ? 'itemNames'
+      : reportUi.type === 'expenses' ? 'categoryIds' : 'workerIds';
+    const filterLabel = reportUi.type === 'profits' ? 'الأصناف المطلوبة'
+      : reportUi.type === 'expenses' ? 'فئات المصروفات' : 'العمال';
+    const allFlag = reportUi.type === 'expenses' ? 'allCategories' : 'allWorkers';
+    const showAll = reportUi.type === 'expenses' || reportUi.type === 'withdrawals';
+    const filter = reportUi.type === 'general' ? '' : `<div class="card report-filter"><div class="fld">${filterLabel}</div>${showAll ? `<label class="report-all"><input type="checkbox" data-report-all="${allFlag}"${reportUi[allFlag] ? ' checked' : ''}> ${reportUi.type === 'expenses' ? 'تضمين جميع الفئات' : 'تضمين جميع العمال'}</label>` : ''}<div class="report-choice-list ${reportUi[allFlag] && showAll ? 'disabled' : ''}">${optionList.map((item) => `<label class="report-choice"><input type="checkbox" data-report-choice="${filterKey}" value="${esc(item.value)}"${selected.includes(item.value) ? ' checked' : ''}${reportUi[allFlag] && showAll ? ' disabled' : ''}><span>${esc(item.name)}${item.active === false ? ' — موقوف' : ''}</span></label>`).join('') || '<div class="empty">لا توجد عناصر مسجلة لهذا النوع حالياً.</div>'}</div><div class="sub">${reportUi.type === 'profits' ? 'اختر صنفاً واحداً أو عدة أصناف. لا يوجد خيار لدمج جميع الأصناف تلقائياً.' : 'يمكنك اختيار جميع العناصر أو تحديد عنصراً واحداً أو عدة عناصر.'}</div></div>`;
+    let periodFields = '';
+    if (reportUi.period === 'day') periodFields = `<label class="fld">اليوم<input type="date" id="reportDay" value="${esc(reportUi.day)}"></label>`;
+    else if (reportUi.period === 'month') periodFields = `<label class="fld">الشهر والسنة<input type="month" id="reportMonth" value="${esc(reportUi.month)}"></label>`;
+    else periodFields = `<label class="fld">من تاريخ<input type="date" id="reportFrom" value="${esc(reportUi.from)}"></label><label class="fld">إلى تاريخ<input type="date" id="reportTo" value="${esc(reportUi.to)}"></label>`;
+    return `<div class="report-types">${types.map(([key, title, icon, desc]) => `<button class="report-type ${reportUi.type === key ? 'selected' : ''}" data-act="report-type" data-type="${key}"><span>${ic(icon, 'l')}</span><b>${title}</b><small>${desc}</small></button>`).join('')}</div>
+      <div class="card report-controls"><div class="bar"><label class="fld">الفترة<select id="reportPeriod"><option value="day"${reportUi.period === 'day' ? ' selected' : ''}>يوم محدد</option><option value="month"${reportUi.period === 'month' ? ' selected' : ''}>شهر وسنة</option><option value="range"${reportUi.period === 'range' ? ' selected' : ''}>من تاريخ إلى تاريخ</option></select></label>${periodFields}</div>${filter}<div class="btns"><button class="btn p" data-act="report-preview">${ic('chart')} معاينة التقرير</button><button class="btn" data-act="report-pdf" ${reportUi.preview ? '' : 'disabled'}>${ic('download')} إنشاء PDF وحفظه</button></div><div class="sub report-hint">سيتم استخراج البيانات مباشرة من قاعدة SQLite وفق الاختيارات الحالية.</div></div>
+      ${reportUi.preview ? reportPreviewMarkup(reportUi.preview) : '<div class="empty report-empty">حدد التقرير والفترة والعناصر المطلوبة، ثم اضغط «معاينة التقرير» لمراجعة البيانات قبل إنشاء PDF.</div>'}`;
   },
   mgmt(kind) {
     const entries = (S[kind] || []).filter((item) => item.name.includes(q));
@@ -115,31 +143,147 @@ const V = {
   settings() {
     const runtime = S.runtime || {};
     const log = S.log || [];
-    const opNames = { create: 'إضافة', update: 'تعديل', soft_delete: 'حذف منطقي', activate: 'تفعيل', deactivate: 'إيقاف', backup_restore: 'استعادة نسخة', import: 'استيراد' };
-    return `<div class="card"><label class="fld">العملة<select id="curCode">${Object.entries(CURS).map(([code, symbol]) => `<option value="${code}"${S.currencyCode === code ? ' selected' : ''}>${code} — ${symbol}</option>`).join('')}<option value="custom"${S.currencyCode === 'custom' ? ' selected' : ''}>أخرى (نص مخصص)</option></select></label><label class="fld">النص المخصص (عند اختيار أخرى)<input id="cur" value="${esc(S.currency)}" maxlength="12"></label><button class="btn p" data-act="cur">حفظ العملة</button></div>${backupCard(runtime)}<h2>الإدارة</h2><div class="btns"><button class="btn" data-go="items">${ic('package')} الأصناف</button><button class="btn" data-go="workers">${ic('users')} العمال</button><button class="btn" data-act="cats">${ic('receipt')} تصنيفات المصروفات</button></div><h2>سجل التغييرات</h2><div class="card">${log.length ? log.slice(0, 40).map((entry) => { const detail = entry.after || entry.before || {}; const name = detail.name || detail.item_name || detail.category_name_snapshot || detail.worker_name_snapshot || entry.entityId; return `<div class="row"><div class="m"><div class="d">${opNames[entry.op] || entry.op} — ${esc(name)}</div><div class="s">${new Date(entry.at).toLocaleString('ar-EG-u-nu-latn')} · ${esc(entry.entityType || '')}</div></div></div>`; }).join('') : '<div class="empty">لا توجد تغييرات</div>'}</div><h2>معلومات النظام</h2><div class="card sub">MowxBack — تخزين محلي عبر SQLite. إصدار قاعدة البيانات: ${esc(runtime.databaseVersion ?? '')}<br>مسار القاعدة: ${esc(runtime.databasePath || 'غير متاح')}<br>الفحص: ${runtime.integrityOk ? 'سليم' : 'لم يُفحص بعد أو توجد مشكلة'}<br>لا توجد مزامنة أو اتصال سحابي.</div>`;
+    const normalizedQuery = auditQuery.trim().toLocaleLowerCase();
+    const filteredLog = normalizedQuery ? log.filter((entry) => auditSearchText(entry).includes(normalizedQuery)) : log;
+    const entries = filteredLog.map(auditEntryMarkup).join('');
+    const hasMore = log.length < Number(S.auditLogCount || log.length);
+    return `<div class="card"><label class="fld">العملة<select id="curCode">${Object.entries(CURS).map(([code, symbol]) => `<option value="${code}"${S.currencyCode === code ? ' selected' : ''}>${code} — ${symbol}</option>`).join('')}<option value="custom"${S.currencyCode === 'custom' ? ' selected' : ''}>أخرى (نص مخصص)</option></select></label><label class="fld">النص المخصص (عند اختيار أخرى)<input id="cur" value="${esc(S.currency)}" maxlength="12"></label><button class="btn p" data-act="cur">حفظ العملة</button></div>${backupCard(runtime)}<h2>الإدارة</h2><div class="btns"><button class="btn" data-go="items">${ic('package')} الأصناف</button><button class="btn" data-go="workers">${ic('users')} العمال</button><button class="btn" data-act="cats">${ic('receipt')} تصنيفات المصروفات</button></div>
+      <div class="audit-heading"><div><h2>سجل التغييرات</h2><div class="sub">سجل تدقيق محلي متسلسل للعمليات التي تمت على بيانات النظام وإعداداته.</div></div><span class="badge">${fmtNum(S.auditLogCount || log.length, 0)} سجل</span></div>
+      <div class="card audit-card"><div class="audit-notice">${ic('check','s')} سجل للقراءة فقط. لا يمكن تعديل السجلات أو حذفها من داخل التطبيق، وتُحفظ تفاصيل العملية السابقة واللاحقة عند توفرها.</div><label class="fld">البحث في السجل<input id="auditSearch" type="search" value="${esc(auditQuery)}" placeholder="ابحث باسم أو نوع عملية أو رقم سجل"></label>${entries || '<div class="empty">لا توجد سجلات مطابقة.</div>'}${hasMore ? `<button class="btn audit-more" data-act="audit-more" ${auditLoading ? 'disabled' : ''}>${auditLoading ? 'جارٍ تحميل السجلات…' : 'عرض سجلات أقدم'}</button>` : ''}</div>
+      <h2>معلومات النظام</h2><div class="card sub">MowxBack — تخزين محلي عبر SQLite. إصدار قاعدة البيانات: ${esc(runtime.databaseVersion ?? '')}<br>مسار القاعدة: ${esc(runtime.databasePath || 'غير متاح')}<br>الفحص: ${runtime.integrityOk ? 'سليم' : 'لم يُفحص بعد أو توجد مشكلة'}<br>لا توجد مزامنة أو اتصال سحابي.</div>`;
   },
 };
 
 function reportRange() {
-  if (rep.kind === 'day') return { from: rep.day, to: rep.day };
-  if (rep.kind === 'month') {
-    const first = `${rep.day.slice(0, 8)}01`;
-    const date = new Date(Number(rep.day.slice(0, 4)), Number(rep.day.slice(5, 7)), 0);
-    const last = `${rep.day.slice(0, 8)}${String(date.getDate()).padStart(2, '0')}`;
-    return { from: first, to: last };
+  if (reportUi.period === 'day') return { from: reportUi.day, to: reportUi.day };
+  if (reportUi.period === 'month') {
+    const [year, month] = reportUi.month.split('-').map(Number);
+    if (!year || !month || month < 1 || month > 12) throw new Error('اختر شهراً وسنة صحيحين.');
+    const lastDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
+    return { from: `${reportUi.month}-01`, to: `${reportUi.month}-${String(lastDay).padStart(2, '0')}` };
   }
-  return { from: rep.from, to: rep.to };
+  return { from: reportUi.from, to: reportUi.to };
+}
+
+function reportPayload() {
+  const range = reportRange();
+  if (!range.from || !range.to || range.from > range.to) throw new Error('تحقق من بداية الفترة ونهايتها.');
+  const payload = { type: reportUi.type, fromDate: range.from, toDate: range.to };
+  if (reportUi.type === 'profits') payload.itemNames = reportUi.itemNames;
+  if (reportUi.type === 'expenses') { payload.allCategories = reportUi.allCategories; payload.categoryIds = reportUi.allCategories ? [] : reportUi.categoryIds; }
+  if (reportUi.type === 'withdrawals') { payload.allWorkers = reportUi.allWorkers; payload.workerIds = reportUi.allWorkers ? [] : reportUi.workerIds; }
+  return payload;
+}
+
+function reportPreviewMarkup(data) {
+  const cfg = S;
+  const table = (headers, rows) => rows.length ? `<div class="scroll"><table><thead><tr>${headers.map((value) => `<th>${esc(value)}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>` : '<div class="empty">لا توجد حركات ضمن الاختيارات الحالية.</div>';
+  const statCard = (label, value, cls = '') => `<div class="card report-stat"><div class="sub">${esc(label)}</div><b class="${cls}">${typeof value === 'number' ? money(value) : esc(value)}</b></div>`;
+  let body = '';
+  if (data.type === 'general') {
+    const t = data.totals;
+    const movementTypes = { profit: 'ربح صنف', expense: 'مصروف', withdrawal: 'سحبية عامل' };
+    body = `<div class="grid c3 report-stats">${statCard('الأرباح',t.profit,'gain')}${statCard('المصروفات',t.expenses,'loss')}${statCard('السحبيات',t.withdrawals,'warn')}${statCard('صافي الفترة',t.net,t.net >= 0 ? 'gain' : 'loss')}${statCard('عدد الأيام',data.daily.length)}${statCard('الكمية الإجمالية',fmtNum(t.quantity))}</div><h3>الحركة اليومية</h3>${table(['التاريخ','الأرباح','المصروفات','السحبيات','صافي اليوم'],data.daily.map((r)=>`<tr><td class="num">${esc(r.date)}</td><td>${money(r.profit)}</td><td>${money(r.expenses)}</td><td>${money(r.withdrawals)}</td><td>${money(r.net)}</td></tr>`))}<h3>تفاصيل الحركات المسجلة</h3>${table(['التاريخ','نوع الحركة','الصنف أو الجهة','الكمية','المبلغ','الوصف والملاحظات'],(data.movements || []).map((r)=>`<tr><td class="num">${esc(r.date)}</td><td>${movementTypes[r.type] || esc(r.type)}</td><td>${esc(r.party)}</td><td class="num">${r.quantity === null ? '—' : fmtNum(r.quantity)}</td><td>${money(r.amount)}</td><td>${esc([r.description,r.notes].filter(Boolean).join(' — ') || '—')}</td></tr>`))}<h3>الأرباح حسب الصنف</h3>${table(['الصنف','الكمية','الربح'],data.items.map((r)=>`<tr><td>${esc(r.name)}</td><td class="num">${fmtNum(r.qty)}</td><td>${money(r.amount)}</td></tr>`))}<h3>المصروفات حسب الفئة</h3>${table(['الفئة','الإجمالي'],data.categories.map((r)=>`<tr><td>${esc(r.name)}</td><td>${money(r.amount)}</td></tr>`))}<h3>السحبيات حسب العامل</h3>${table(['العامل','الإجمالي'],data.workers.map((r)=>`<tr><td>${esc(r.name)}</td><td>${money(r.amount)}</td></tr>`))}`;
+  } else if (data.type === 'profits') {
+    const t=data.totals;
+    body = `<div class="grid c3 report-stats">${statCard('إجمالي الأرباح',t.amount,'gain')}${statCard('إجمالي الكميات',fmtNum(t.quantity))}${statCard('عدد الحركات',t.operationCount)}</div><h3>حسب الصنف</h3>${table(['الصنف','الكمية','الربح'],data.byItem.map((r)=>`<tr><td>${esc(r.name)}</td><td class="num">${fmtNum(r.quantity)}</td><td>${money(r.amount)}</td></tr>`))}<h3>حسب اليوم</h3>${table(['التاريخ','الكمية','الربح','عدد الحركات'],data.byDay.map((r)=>`<tr><td class="num">${esc(r.date)}</td><td class="num">${fmtNum(r.quantity)}</td><td>${money(r.amount)}</td><td class="num">${r.operationCount}</td></tr>`))}<h3>تفاصيل الحركات</h3>${table(['التاريخ','الصنف','الكمية','الربح','ملاحظات'],data.rows.map((r)=>`<tr><td class="num">${esc(r.date)}</td><td>${esc(r.itemName)}</td><td class="num">${fmtNum(r.quantity)}</td><td>${money(r.amount)}</td><td>${esc(r.notes || '—')}</td></tr>`))}`;
+  } else if (data.type === 'expenses') {
+    body = `<div class="grid c2 report-stats">${statCard('إجمالي المصروفات',data.totals.amount,'loss')}${statCard('عدد العمليات',data.totals.operationCount)}</div><h3>حسب الفئة</h3>${table(['الفئة','العدد','الإجمالي'],data.byCategory.map((r)=>`<tr><td>${esc(r.name)}</td><td class="num">${r.operationCount}</td><td>${money(r.amount)}</td></tr>`))}<h3>تفاصيل المصروفات</h3>${table(['التاريخ','الفئة','الوصف','المبلغ','الملاحظات'],data.rows.map((r)=>`<tr><td class="num">${esc(r.date)}</td><td>${esc(r.category)}</td><td>${esc(r.description)}</td><td>${money(r.amount)}</td><td>${esc(r.notes || '—')}</td></tr>`))}`;
+  } else {
+    body = `<div class="grid c2 report-stats">${statCard('إجمالي السحبيات',data.totals.amount,'warn')}${statCard('عدد السحبيات',data.totals.operationCount)}</div><h3>حسب العامل</h3>${table(['العامل','العدد','الإجمالي'],data.byWorker.map((r)=>`<tr><td>${esc(r.name)}</td><td class="num">${r.operationCount}</td><td>${money(r.amount)}</td></tr>`))}<h3>تفاصيل السحبيات</h3>${table(['التاريخ','العامل','المبلغ','الملاحظات'],data.rows.map((r)=>`<tr><td class="num">${esc(r.date)}</td><td>${esc(r.worker)}</td><td>${money(r.amount)}</td><td>${esc(r.notes || '—')}</td></tr>`))}`;
+  }
+  return `<section class="card report-preview"><div class="row"><div class="m"><b>معاينة: ${esc(data.title)}</b><div class="sub">${esc(data.fromDate)} إلى ${esc(data.toDate)} · معاينة قبل تصدير PDF</div></div><span class="badge gain">جاهز للمراجعة</span></div>${body}</section>`;
+}
+
+const AUDIT_ACTIONS = {
+  create: 'إضافة سجل', update: 'تعديل سجل', soft_delete: 'حذف منطقي', restore: 'استعادة سجل',
+  activate: 'تفعيل عنصر', deactivate: 'إيقاف عنصر', import: 'استيراد بيانات',
+  backup_restore: 'استعادة نسخة احتياطية', database_move: 'نقل قاعدة البيانات', reset: 'إعادة ضبط',
+  report_export: 'إنشاء ملف تقرير PDF', application_error: 'تسجيل خطأ في التطبيق',
+};
+const AUDIT_ENTITIES = {
+  profit_transaction: 'حركة أرباح', profit_line: 'سطر ربح لصنف', expense: 'مصروف', withdrawal: 'سحبية عامل',
+  item: 'صنف', worker: 'عامل', expense_category: 'فئة مصروفات', system: 'عملية نظام',
+};
+const AUDIT_FIELDS = {
+  name: 'الاسم', item_name: 'اسم الصنف', itemName: 'اسم الصنف', worker_name_snapshot: 'اسم العامل',
+  category_name_snapshot: 'فئة المصروفات', date: 'التاريخ', tx_date: 'التاريخ',
+  amountMilli: 'المبلغ', amount_milli: 'المبلغ', quantityMicros: 'الكمية', quantity_micros: 'الكمية',
+  description: 'الوصف', notes: 'الملاحظات', note: 'الملاحظات', active: 'الحالة', is_active: 'الحالة',
+  currencyCode: 'رمز العملة', currencyLabel: 'اسم العملة', currencyDecimalPlaces: 'الخانات العشرية',
+  lineCount: 'عدد الأصناف', deleted: 'حالة السجل', message: 'رسالة الخطأ', stack: 'التفاصيل التقنية للخطأ',
+  source: 'مصدر الخطأ', screen: 'الشاشة', reportType: 'نوع التقرير', title: 'عنوان التقرير',
+  fromDate: 'من تاريخ', toDate: 'إلى تاريخ', fileName: 'اسم الملف', bytes: 'حجم الملف بالبايت',
+  value: 'القيمة',
+};
+function auditValue(key, value) {
+  if (value === null || value === undefined || value === '') return '—';
+  if (['amountMilli','amount_milli'].includes(key) && Number.isFinite(Number(value))) return money(Number(value) / 1000);
+  if (['quantityMicros','quantity_micros'].includes(key) && Number.isFinite(Number(value))) return fmtNum(Number(value) / 1000000);
+  if (['active','is_active'].includes(key)) return value === true || value === 1 ? 'نشط' : 'موقوف';
+  if (key === 'lines' && Array.isArray(value)) return value.map((line) => `${line.name || line.item_name || 'صنف'} — كمية ${fmtNum((line.quantityMicros ?? line.quantity_micros ?? line.qty ?? 0) / (line.quantityMicros || line.quantity_micros ? 1000000 : 1))} — ${line.amountMilli !== undefined ? money(line.amountMilli / 1000) : line.amount_milli !== undefined ? money(line.amount_milli / 1000) : line.amount !== undefined ? money(line.amount) : ''}`).join('، ');
+  if (key === 'stack') return `<code class="audit-stack">${esc(value)}</code>`;
+  if (typeof value === 'object') return esc(JSON.stringify(value));
+  return esc(String(value));
+}
+function auditSnapshotMarkup(snapshot, title) {
+  if (!snapshot || typeof snapshot !== 'object') return '';
+  const pairs = Object.entries(snapshot).filter(([key]) => !['id','created_at','updated_at','deleted_at','transaction_id','legacy_ref_id','item_id','category_id','worker_id'].includes(key));
+  if (!pairs.length) return '';
+  return `<div class="audit-snapshot"><b>${title}</b><div>${pairs.map(([key,value]) => `<span><small>${esc(AUDIT_FIELDS[key] || key)}</small>${auditValue(key,value)}</span>`).join('')}</div></div>`;
+}
+function auditSubject(entry) {
+  const details = entry.after || entry.before || {};
+  if (entry.entityType === 'system' && String(entry.entityId).startsWith('setting:')) {
+    const key = String(entry.entityId).slice('setting:'.length);
+    const labels = { currencyCode: 'رمز العملة', currencyLabel: 'اسم العملة', currencyDecimalPlaces: 'الخانات العشرية' };
+    return `إعداد ${labels[key] || key}`;
+  }
+  return details.name || details.item_name || details.itemName || details.category_name_snapshot || details.worker_name_snapshot || details.description || details.message || details.title || (Array.isArray(details.lines) ? details.lines.map((line) => line.name || line.item_name).filter(Boolean).join('، ') : '') || entry.entityId;
+}
+function auditActionText(entry) {
+  const byEntity = {
+    create: {
+      profit_transaction: 'تسجيل حركة أرباح', profit_line: 'إضافة صنف إلى حركة أرباح',
+      expense: 'تسجيل مصروف', withdrawal: 'تسجيل سحبية عامل', item: 'إضافة صنف إلى القائمة',
+      worker: 'إضافة عامل', expense_category: 'إضافة فئة مصروفات', system: 'إضافة إعداد للنظام',
+    },
+    update: {
+      profit_transaction: 'تعديل تاريخ حركة أرباح', profit_line: 'تعديل تفاصيل ربح صنف',
+      expense: 'تعديل مصروف', withdrawal: 'تعديل سحبية عامل', item: 'تعديل بيانات صنف',
+      worker: 'تعديل بيانات عامل', expense_category: 'تعديل فئة مصروفات', system: 'تعديل إعدادات النظام',
+    },
+    soft_delete: {
+      profit_transaction: 'حذف حركة أرباح', profit_line: 'حذف سطر ربح',
+      expense: 'حذف مصروف', withdrawal: 'حذف سحبية عامل',
+    },
+    activate: { item: 'تفعيل صنف', worker: 'تفعيل عامل', expense_category: 'تفعيل فئة مصروفات' },
+    deactivate: { item: 'إيقاف صنف', worker: 'إيقاف عامل', expense_category: 'إيقاف فئة مصروفات' },
+  };
+  return byEntity[entry.op]?.[entry.entityType] || AUDIT_ACTIONS[entry.op] || 'عملية مسجلة';
+}
+function auditEntryMarkup(entry) {
+  const action = auditActionText(entry);
+  const entity = AUDIT_ENTITIES[entry.entityType] || entry.entityType;
+  const details = `${entity} — ${auditSubject(entry)}`;
+  const timestamp = new Date(entry.occurredAt || entry.at).toLocaleString('ar-JO-u-nu-latn');
+  const before = auditSnapshotMarkup(entry.before, 'قبل العملية');
+  const after = auditSnapshotMarkup(entry.after, 'بعد العملية');
+  return `<details class="audit-entry"><summary><span class="audit-symbol">${ic(entry.op === 'application_error' ? 'x' : entry.op === 'soft_delete' ? 'receipt' : 'check','s')}</span><span class="audit-summary"><b>${esc(action)} — ${esc(details)}</b><small>${esc(timestamp)} · ${esc(entity)} · رقم السجل: ${esc(entry.entityId)}</small></span><span class="sub audit-chevron">التفاصيل</span></summary><div class="audit-body">${before}${after || '<div class="sub">لم تُسجل قيم لاحقة لهذه العملية.</div>'}<div class="sub">المصدر: تطبيق MowxBack المحلي · سجل للقراءة فقط</div></div></details>`;
+}
+function auditSearchText(entry) {
+  return [AUDIT_ACTIONS[entry.op] || entry.op, AUDIT_ENTITIES[entry.entityType] || entry.entityType, entry.entityId,
+    JSON.stringify(entry.before || {}), JSON.stringify(entry.after || {})].join(' ').toLocaleLowerCase();
 }
 
 async function render() {
   if (!S) return;
   const sequence = ++renderSequence;
   if (page === 'reports') {
-    const range = reportRange();
     try {
-      rep.cur = await Store.report(range.from, range.to);
+      if (!reportOptionsData) reportOptionsData = await Store.reportOptions();
     } catch (error) {
-      if (sequence === renderSequence) $('view').innerHTML = `<div class="empty loss">تعذر استخراج التقرير من SQLite: ${esc(error.message)}</div>`;
+      if (sequence === renderSequence) $('view').innerHTML = `<div class="empty loss">تعذر تحميل خيارات التقارير من SQLite: ${esc(error.message)}</div>`;
       return;
     }
     if (sequence !== renderSequence) return;
@@ -163,14 +307,34 @@ async function render() {
 
 async function refreshState() {
   S = await Store.load();
+  reportOptionsData = null;
   await render();
 }
 function go(nextPage) { page = nextPage; q = ''; closeM(); render(); window.scrollTo(0, 0); }
 function closeM() { $('modal').hidden = true; $('modal').innerHTML = ''; }
 function showError(error) {
   console.error(error);
-  toast(error?.message ? `تعذر تنفيذ العملية: ${error.message}` : 'تعذر تنفيذ العملية', 'err');
+  const message = error?.message ? String(error.message).slice(0, 1500) : 'حدث خطأ غير محدد.';
+  const stack = String(error?.stack || '').slice(0, 8000);
+  toast(`تعذر تنفيذ العملية: ${message}`, 'err');
+  Store.logApplicationError({ screen: page, message, stack, source: 'renderer-caught-error' })
+    .catch((logError) => console.error('تعذر تسجيل الخطأ:', logError));
 }
+
+window.addEventListener('error', (event) => {
+  const error = event.error;
+  Store.logApplicationError({
+    screen: page, message: String(event.message || error?.message || 'خطأ غير معالج في الواجهة').slice(0, 1500),
+    stack: String(error?.stack || '').slice(0, 8000), source: 'renderer-uncaught-error',
+  }).catch((logError) => console.error('تعذر تسجيل خطأ الواجهة:', logError));
+});
+window.addEventListener('unhandledrejection', (event) => {
+  const reason = event.reason;
+  Store.logApplicationError({
+    screen: page, message: String(reason?.message || reason || 'رفض Promise غير معالج').slice(0, 1500),
+    stack: String(reason?.stack || '').slice(0, 8000), source: 'renderer-unhandled-rejection',
+  }).catch((logError) => console.error('تعذر تسجيل رفض Promise:', logError));
+});
 function backupCard(runtime) {
   const folder = runtime.backupDirectory;
   return `<h2>قاعدة البيانات والنسخ الاحتياطي</h2><div class="card"><div class="sub" style="margin-bottom:12px">ملف SQLite محفوظ خارج مجلد تثبيت البرنامج. مجلد النسخ الاحتياطي مستقل عن مجلد قاعدة البيانات.</div><div class="row"><div class="m"><div class="s">موقع قاعدة البيانات</div><div class="d">${esc(runtime.databasePath || 'غير محدد')}</div></div><button class="btn" data-act="dbfolder">تغيير المجلد</button></div><div class="row"><div class="m"><div class="s">مجلد النسخ الاحتياطي</div><div class="d">${folder ? esc(folder) : 'لم يُحدد مجلد'}</div></div></div><div class="btns"><button class="btn p" data-act="bpick">${folder ? 'تغيير مجلد النسخ' : 'اختيار مجلد النسخ'}</button>${folder ? '<button class="btn" data-act="bdel">إزالة اختيار المجلد</button><button class="btn" data-act="bsave">حفظ نسخة في المجلد</button>' : ''}<button class="btn" data-act="bdl">حفظ نسخة باسم...</button><button class="btn" data-act="brestore">استعادة نسخة SQLite</button><button class="btn" data-act="bimport">استيراد JSON قديم</button><button class="btn" data-act="bjson">تصدير JSON</button><button class="btn" data-act="bintegrity">فحص سلامة القاعدة</button></div><div class="sub" style="margin-top:8px">النسخ الاحتياطي التلقائي اليومي غير مفعل في هذا الإصدار.</div></div>`;
@@ -458,6 +622,25 @@ document.addEventListener('click', async (event) => {
       $('modal').hidden = false;
       $('modal').innerHTML = `<div class="sheet"><h3>المزيد</h3><div class="grid">${PAGES.filter((entry) => !MAIN.includes(entry[0])).map((entry) => `<button class="btn" data-go="${entry[0]}">${ic(entry[2])}${entry[1]}</button>`).join('')}<button class="btn" id="fc2">إغلاق</button></div></div>`;
       $('fc2').onclick = closeM;
+    } else if (act === 'report-type') { reportUi.type = type; reportUi.preview = null; await render(); }
+    else if (act === 'report-preview') {
+      const payload = reportPayload();
+      if (reportUi.type === 'profits' && !reportUi.itemNames.length) throw new Error('اختر صنفاً واحداً على الأقل.');
+      if (reportUi.type === 'expenses' && !reportUi.allCategories && !reportUi.categoryIds.length) throw new Error('اختر فئة واحدة على الأقل أو فعّل جميع الفئات.');
+      if (reportUi.type === 'withdrawals' && !reportUi.allWorkers && !reportUi.workerIds.length) throw new Error('اختر عاملاً واحداً على الأقل أو فعّل جميع العمال.');
+      reportUi.preview = await Store.customReport(payload); await render(); toast('تم تجهيز معاينة التقرير');
+    } else if (act === 'report-pdf') {
+      if (!reportUi.preview) throw new Error('اعرض المعاينة أولاً قبل إنشاء ملف PDF.');
+      const result = await Store.exportReportPdf(reportPayload());
+      if (!result.canceled) { await refreshState(); toast('تم حفظ ملف PDF بنجاح'); }
+    } else if (act === 'audit-more') {
+      if (auditLoading) return;
+      auditLoading = true; await render();
+      try {
+        const result = await Store.auditLog({ limit: 100, offset: S.log.length, search: auditQuery });
+        S.log.push(...result.items); S.auditLogCount = result.total;
+      } finally { auditLoading = false; }
+      await render();
     } else if (act === 'pdf') window.print();
     else if (act === 'xls') csv();
   } catch (error) { showError(error); }
@@ -469,9 +652,36 @@ document.addEventListener('change', async (event) => {
   else if (target.dataset.rng) { rng[target.dataset.rng] = target.value; await render(); }
   else if (target.id === 'repKind') { rep.kind = target.value; await render(); }
   else if (target.dataset.rep) { rep[target.dataset.rep] = target.value; await render(); }
+  else if (target.id === 'reportPeriod') { reportUi.period = target.value; reportUi.preview = null; await render(); }
+  else if (target.id === 'reportDay') { reportUi.day = target.value; reportUi.preview = null; await render(); }
+  else if (target.id === 'reportMonth') { reportUi.month = target.value; reportUi.preview = null; await render(); }
+  else if (target.id === 'reportFrom') { reportUi.from = target.value; reportUi.preview = null; await render(); }
+  else if (target.id === 'reportTo') { reportUi.to = target.value; reportUi.preview = null; await render(); }
+  else if (target.dataset.reportChoice) {
+    const key = target.dataset.reportChoice;
+    reportUi[key] = target.checked ? [...new Set([...reportUi[key], target.value])] : reportUi[key].filter((value) => value !== target.value);
+    reportUi.preview = null; await render();
+  }
+  else if (target.dataset.reportAll) { reportUi[target.dataset.reportAll] = target.checked; reportUi.preview = null; await render(); }
 });
 document.addEventListener('input', (event) => {
-  if (event.target.id === 'q') {
+  if (event.target.id === 'auditSearch') {
+    auditQuery = event.target.value;
+    const position = event.target.selectionStart;
+    const sequence = ++auditSearchSequence;
+    clearTimeout(auditSearchTimer);
+    auditSearchTimer = setTimeout(async () => {
+      try {
+        const result = await Store.auditLog({ limit: 100, offset: 0, search: auditQuery });
+        if (sequence !== auditSearchSequence) return;
+        S.log = result.items; S.auditLogCount = result.total;
+      } catch (error) { if (sequence === auditSearchSequence) showError(error); }
+      if (sequence !== auditSearchSequence) return;
+      await render();
+      const input = $('auditSearch');
+      if (input) { input.focus(); input.setSelectionRange(position, position); }
+    }, 180);
+  } else if (event.target.id === 'q') {
     q = event.target.value;
     const position = event.target.selectionStart;
     render().then(() => { const input = $('q'); if (input) { input.focus(); input.setSelectionRange(position, position); } });
