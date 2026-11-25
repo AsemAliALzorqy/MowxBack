@@ -21,7 +21,7 @@
   const footer = () => `<footer class="report-footer"><span><span class="brand-small">MowxBack</span> — تقرير صادر من التطبيق</span><span>البيانات مستخرجة من قاعدة SQLite المحلية</span></footer>`;
   const general = (data) => {
     const t = data.totals; const cfg = data.currency;
-    const cards = `<div class="summary-grid">${summaryCard('إجمالي الأرباح', t.profit, cfg, 'gain')}${summaryCard('إجمالي المصروفات', t.expenses, cfg, 'loss')}${summaryCard('سحبيات العمال', t.withdrawals, cfg, 'warn')}${summaryCard('صافي الفترة', t.net, cfg, t.net >= 0 ? 'gain' : 'loss')}${summaryTextCard('عدد أيام الفترة', String(data.daily.length))}${summaryTextCard('إجمالي كميات الأرباح', num(t.quantity, 3))}</div>`;
+    const cards = `<div class="summary-grid">${summaryCard('إجمالي الأرباح', t.profit, cfg, 'gain')}${summaryCard('إجمالي المصروفات', t.expenses, cfg, 'loss')}${summaryCard('سحبيات العمال', t.withdrawals, cfg, 'warn')}${summaryCard('صافي الفترة', t.net, cfg, t.net >= 0 ? 'gain' : 'loss')}${summaryTextCard('عدد الحركات', String(data.movementCount ?? (data.movements || []).length))}${summaryTextCard('إجمالي كميات الأرباح', num(t.quantity, 3))}</div>`;
     const daily = renderRows(data.daily, ['التاريخ','الأرباح','المصروفات','السحبيات','صافي اليوم'], (r) => [dateText(r.date),currency(r.profit,cfg),currency(r.expenses,cfg),currency(r.withdrawals,cfg),currency(r.net,cfg)]);
     const items = renderRows(data.items, ['الصنف','الكمية','إجمالي الربح'], (r) => [esc(r.name),`<span class="num">${num(r.qty,3)}</span>`,currency(r.amount,cfg)]);
     const cats = renderRows(data.categories, ['الفئة','إجمالي المصروفات'], (r) => [esc(r.name),currency(r.amount,cfg)]);
@@ -36,11 +36,11 @@
   };
   const profits = (data) => {
     const cfg = data.currency; const t = data.totals;
-    const cards = `<div class="summary-grid">${summaryCard('إجمالي أرباح الأصناف المحددة',t.amount,cfg,'gain')}${summaryTextCard('إجمالي الكميات',num(t.quantity,3))}${summaryTextCard('عدد الحركات',String(t.operationCount))}</div>`;
+    const cards = `<div class="summary-grid">${summaryCard(data.scope === 'all' ? 'إجمالي أرباح جميع الأصناف' : 'إجمالي أرباح الأصناف المحددة',t.amount,cfg,'gain')}${summaryTextCard('إجمالي الكميات',num(t.quantity,3))}${summaryTextCard('عدد الحركات',String(t.operationCount))}</div>`;
     const items = renderRows(data.byItem,['الصنف','الكمية','الربح','عدد الحركات'],(r)=>[esc(r.name),`<span class="num">${num(r.quantity,3)}</span>`,currency(r.amount,cfg),`<span class="num">${r.operationCount}</span>`]);
     const days = renderRows(data.byDay,['التاريخ','الكمية','الربح','عدد الحركات'],(r)=>[dateText(r.date),`<span class="num">${num(r.quantity,3)}</span>`,currency(r.amount,cfg),`<span class="num">${r.operationCount}</span>`]);
     const rows = renderRows(data.rows,['التاريخ','الصنف','الكمية','الربح','الملاحظات'],(r)=>[dateText(r.date),esc(r.itemName),`<span class="num">${num(r.quantity,3)}</span>`,currency(r.amount,cfg),`<span class="note">${esc(r.notes || '—')}</span>`]);
-    return `${cards}${section('ملخص الأصناف المختارة',items)}${section('التجميع اليومي',days)}${section('تفاصيل حركات الأرباح',rows)}`;
+    return `${cards}${section(data.scope === 'all' ? 'ملخص جميع الأصناف' : 'ملخص الأصناف المختارة',items)}${section('التجميع اليومي',days)}${section('تفاصيل حركات الأرباح',rows)}`;
   };
   const expenses = (data) => {
     const cfg=data.currency; const t=data.totals;
@@ -59,7 +59,7 @@
   window.renderMowxReport = (data) => {
     if (!data || !data.type || !data.currency) throw new Error('بيانات التقرير غير مكتملة.');
     const body = data.type === 'general' ? general(data) : data.type === 'profits' ? profits(data) : data.type === 'expenses' ? expenses(data) : data.type === 'withdrawals' ? withdrawals(data) : '<div class="empty">نوع التقرير غير معروف</div>';
-    root.innerHTML = `${header(data)}<div class="content">${body}</div>${footer()}`;
+    root.innerHTML = `${header(data)}<div class="content">${body}</div>`;
     return document.fonts.ready.then(() => true);
   };
 })();

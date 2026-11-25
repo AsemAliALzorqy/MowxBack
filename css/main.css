@@ -85,3 +85,7 @@ table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:10px 8px;
 
 /* Read-only audit detail stack: wrap long technical traces without widening the page. */
 .audit-stack{display:block;white-space:pre-wrap;overflow-wrap:anywhere;direction:ltr;text-align:left;max-height:240px;overflow:auto;padding:8px;border-radius:6px;background:var(--surface-2,#f1f5f9);font:11px/1.5 ui-monospace,monospace;margin-top:6px}
+
+/* v0.3 report item selector and diagnostics */
+.report-mode{display:flex;flex-wrap:wrap;gap:10px 22px;margin:8px 0 12px}.report-mode label{display:inline-flex;align-items:center;gap:8px;padding:9px 12px;border:1px solid var(--bd);border-radius:10px;background:#fff;font-weight:600}.report-item-picker{display:grid;gap:10px}.report-item-actions{display:flex;flex-wrap:wrap;gap:8px}.report-selected{display:flex;align-items:center;flex-wrap:wrap;gap:7px;padding:9px 0}.report-chip{border:1px solid #cfe0fb;background:#eef4ff;color:var(--navy);border-radius:99px;padding:5px 10px;font-size:12px;cursor:pointer}.report-choice-list{max-height:240px;overflow:auto;border:1px solid var(--bd);border-radius:10px;padding:6px}.report-choice{display:flex;align-items:center;gap:10px;padding:8px;border-bottom:1px solid #f0f2f6}.report-choice:last-child{border-bottom:0}.diagnostic-card .btns{margin-top:10px}
+@media(max-width:480px){.report-item-actions .btn{flex:1}.report-selected{align-items:flex-start}}

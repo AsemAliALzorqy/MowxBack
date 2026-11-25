@@ -7,6 +7,7 @@ const {
   BrowserWindow,
   dialog,
   ipcMain,
+  shell,
 } = require('electron');
 const { openDatabase, integrityReport } = require('../src/database/db');
 const {
@@ -18,12 +19,20 @@ const {
 const { importLegacyBackup } = require('../src/database/legacy-import');
 const Repository = require('../src/database/repository');
 const Money = require('../src/database/money');
+const { DiagnosticLogger } = require('./diagnostic-logger');
 
 let mainWindow = null;
 let db = null;
 let dbPath = null;
 let runtimeConfig = null;
 let isQuitting = false;
+let diagnostics = null;
+let shutdownFlushRequested = false;
+
+function logDiagnostic(event, details = {}, level = 'info') {
+  if (!diagnostics) return Promise.resolve();
+  return diagnostics.log(event, details, level);
+}
 
 async function renderReportPdf(reportData) {
   const pdfWindow = new BrowserWindow({
@@ -43,7 +52,7 @@ async function renderReportPdf(reportData) {
       displayHeaderFooter: true,
       margins: { top: 0.35, right: 0.35, bottom: 0.55, left: 0.35 },
       headerTemplate: '<div></div>',
-      footerTemplate: `<div style="width:100%;font-family:Arial,sans-serif;font-size:8px;color:#64748b;padding:0 12mm;display:flex;justify-content:space-between;"><span>MowxBack</span><span><span class="pageNumber"></span> / <span class="totalPages"></span></span></div>`,
+      footerTemplate: `<div style="width:100%;font-family:Arial,sans-serif;font-size:8px;color:#64748b;padding:0 12mm;display:flex;justify-content:space-between;direction:ltr;"><span>MowxBack</span><span style="direction:ltr;unicode-bidi:isolate"><span class="pageNumber"></span> / <span class="totalPages"></span></span></div>`,
     });
   } finally {
     if (!pdfWindow.isDestroyed()) pdfWindow.destroy();
@@ -207,8 +216,11 @@ function createWindow() {
 
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.webContents.on('will-navigate', (event) => event.preventDefault());
-  mainWindow.once('ready-to-show', () => mainWindow.show());
-  mainWindow.on('closed', () => { mainWindow = null; });
+  mainWindow.once('ready-to-show', () => { mainWindow.show(); void logDiagnostic('main-window-shown'); });
+  mainWindow.webContents.on('render-process-gone', (_event, details) => { void logDiagnostic('renderer-process-gone', details, 'error'); });
+  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription) => { void logDiagnostic('renderer-load-failed', { errorCode, errorDescription }, 'error'); });
+  mainWindow.on('close', () => { void logDiagnostic('main-window-close-requested'); });
+  mainWindow.on('closed', () => { void logDiagnostic('main-window-closed'); mainWindow = null; });
   mainWindow.loadFile(path.join(__dirname, '..', 'index.html'));
 }
 
@@ -218,7 +230,15 @@ function registerIpcHandler(channel, handler) {
         event.senderFrame !== mainWindow.webContents.mainFrame) {
       throw new Error('رفض طلب IPC من إطار غير موثوق.');
     }
-    return handler(payload);
+    void logDiagnostic('ipc-start', { channel });
+    try {
+      const result = await handler(payload);
+      void logDiagnostic('ipc-success', { channel });
+      return result;
+    } catch (error) {
+      void logDiagnostic('ipc-failure', { channel, message: String(error?.message || error).slice(0, 1200) }, 'error');
+      throw error;
+    }
   });
 }
 
@@ -242,6 +262,7 @@ function registerIpc() {
     const status = {
       databasePath: dbPath,
       backupDirectory: runtimeConfig.backupDirectory,
+      appVersion: app.getVersion(),
       databaseVersion: db.pragma('user_version', { simple: true }),
       integrityOk: integrityReport(db).ok,
     };
@@ -378,6 +399,7 @@ function registerIpc() {
           withdrawals: milli(result.totals.withdrawal_milli), totalExpenses: milli(result.totals.total_expense_milli),
           net: milli(result.totals.net_milli), quantity: micros(result.totals.quantity_micros),
         },
+        movementCount: result.transactions.length,
         daily: result.daily.map((row) => ({
           date: row.date, profit: milli(row.profit_milli), expenses: milli(row.expense_milli),
           withdrawals: milli(row.withdrawal_milli), net: milli(row.net_milli), quantity: micros(row.quantity_micros),
@@ -401,11 +423,13 @@ function registerIpc() {
       };
     }
     if (type === 'profits') {
-      const selected = Array.isArray(payload.itemNames) ? payload.itemNames.map((v) => stringValue(v, 'Item name', 300)) : [];
+      const selected = payload.allItems === true ? [] : (Array.isArray(payload.itemNames) ? payload.itemNames.map((v) => stringValue(v, 'Item name', 300)) : []);
+      if (payload.allItems !== true && selected.length === 0) throw new Error('Select at least one item or enable all items.');
       const result = Repository.getProfitItemReport(db, fromDate, toDate, selected);
       return {
         ...base,
-        filterSummary: `الأصناف المختارة: ${result.selected.join('، ')}`,
+        filterSummary: payload.allItems === true ? 'جميع الأصناف' : `الأصناف المختارة: ${result.selected.join('، ')}`,
+        scope: payload.allItems === true ? 'all' : 'selected',
         selected: result.selected,
         totals: { amount: milli(result.totals.amount_milli), quantity: micros(result.totals.quantity_micros), operationCount: result.totals.operation_count },
         byItem: result.byItem.map((row) => ({ name: row.name, amount: milli(row.amount_milli), quantity: micros(row.quantity_micros), operationCount: row.operation_count })),
@@ -446,6 +470,7 @@ function registerIpc() {
   registerIpcHandler('mowx:get-custom-report-data', (payload) => prepareReportData(payload));
   registerIpcHandler('mowx:export-custom-report-pdf', async (payload) => {
     const report = prepareReportData(payload);
+    await logDiagnostic('pdf-generation-start', { reportType: report.type, fromDate: report.fromDate, toDate: report.toDate, records: report.type === 'general' ? report.movements.length : report.rows.length });
     const fromStamp = report.fromDate;
     const toStamp = report.toDate;
     const suffix = fromStamp === toStamp ? fromStamp : `${fromStamp}_${toStamp}`;
@@ -458,12 +483,56 @@ function registerIpc() {
     if (result.canceled || !result.filePath) return { canceled: true };
     const pdf = await renderReportPdf(report);
     await fs.writeFile(result.filePath, pdf);
+    await logDiagnostic('pdf-export-success', { reportType: report.type, fileName: path.basename(result.filePath), bytes: pdf.length });
     Repository.recordSystemEvent(db, 'report_export', {
       reportType: report.type, title: report.title, fromDate: report.fromDate,
       toDate: report.toDate, fileName: path.basename(result.filePath), bytes: pdf.length,
     });
     return { canceled: false, path: result.filePath, bytes: pdf.length };
   });
+  registerIpcHandler('mowx:record-diagnostic-log', async (payload) => {
+    requiredObject(payload, 'Diagnostic event');
+    if (!diagnostics) return { recorded: false };
+    const event = stringValue(payload.event, 'Diagnostic event name', 100);
+    const source = payload.details && typeof payload.details === 'object' && !Array.isArray(payload.details) ? payload.details : {};
+    const safeDetails = {
+      screen: typeof source.screen === 'string' ? source.screen.slice(0, 80) : undefined,
+      action: typeof source.action === 'string' ? source.action.slice(0, 100) : undefined,
+      modal: typeof source.modal === 'string' ? source.modal.slice(0, 100) : undefined,
+      reason: typeof source.reason === 'string' ? source.reason.slice(0, 100) : undefined,
+      to: typeof source.to === 'string' ? source.to.slice(0, 80) : undefined,
+      entityType: typeof source.entityType === 'string' ? source.entityType.slice(0, 50) : undefined,
+    };
+    await logDiagnostic(event, safeDetails);
+    return { recorded: true };
+  });
+  registerIpcHandler('mowx:get-diagnostic-status', async () => diagnostics ? diagnostics.status() : ({
+    enabled: false, fileCount: 0, retentionDays: 14, directory: '', lastEntryAt: null,
+  }));
+  registerIpcHandler('mowx:open-diagnostic-folder', async () => {
+    if (!diagnostics) throw new Error('Diagnostic logging is unavailable.');
+    const status = await diagnostics.status();
+    const error = await shell.openPath(status.directory);
+    return error ? { error } : { opened: true };
+  });
+  registerIpcHandler('mowx:export-diagnostic-logs', async () => {
+    if (!diagnostics) throw new Error('Diagnostic logging is unavailable.');
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'تصدير سجلات تشخيص MowxBack', defaultPath: `MowxBack-Logs-${new Date().toISOString().slice(0, 10)}.log`,
+      filters: [{ name: 'Log files', extensions: ['log', 'txt'] }],
+    });
+    if (result.canceled || !result.filePath) return { canceled: true };
+    const content = await diagnostics.exportText();
+    await fs.writeFile(result.filePath, content);
+    await logDiagnostic('diagnostic-export-success', { bytes: content.length, fileName: path.basename(result.filePath) });
+    return { canceled: false, bytes: content.length };
+  });
+  registerIpcHandler('mowx:set-diagnostic-retention', async (payload) => {
+    requiredObject(payload, 'Diagnostic retention');
+    if (!diagnostics) throw new Error('Diagnostic logging is unavailable.');
+    return diagnostics.setRetentionDays(payload.days);
+  });
+
   registerIpcHandler('mowx:get-audit-log', (payload) => {
     const source = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
     const limit = source.limit === undefined ? 100 : source.limit;
@@ -730,6 +799,7 @@ function recordMainProcessError(source, reason) {
     screen: 'العملية الرئيسية', message: String(error.message || error).slice(0, 1500),
     stack: String(error.stack || '').slice(0, 8000), source,
   };
+  void logDiagnostic('main-process-error', details, 'error');
   try {
     if (db) Repository.recordSystemEvent(db, 'application_error', details);
   } catch (logError) {
@@ -747,17 +817,23 @@ process.once('uncaughtException', (error) => {
 
 app.whenReady().then(async () => {
   try {
+    diagnostics = new DiagnosticLogger({ directory: path.join(app.getPath('userData'), 'Logs'), retentionDays: 14 });
+    await diagnostics.init();
+    await logDiagnostic('application-start', { appVersion: app.getVersion(), electronVersion: process.versions.electron, nodeVersion: process.versions.node, platform: process.platform, architecture: process.arch });
     const ready = await ensureDatabase();
+    await logDiagnostic('database-initialized', { databasePath: dbPath, databaseVersion: db?.pragma('user_version', { simple: true }) });
     if (!ready) {
       app.quit();
       return;
     }
     registerIpc();
     createWindow();
+    await logDiagnostic('application-ready', { appVersion: app.getVersion() });
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
   } catch (error) {
+    await logDiagnostic('application-start-failed', { message: String(error?.message || error), stack: String(error?.stack || '').slice(0, 5000) }, 'error');
     await dialog.showMessageBox({
       type: 'error',
       title: 'تعذر تشغيل MowxBack',
@@ -769,8 +845,21 @@ app.whenReady().then(async () => {
   }
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
   isQuitting = true;
+  if (diagnostics && !shutdownFlushRequested) {
+    shutdownFlushRequested = true;
+    event.preventDefault();
+    void logDiagnostic('application-shutdown-requested');
+    void diagnostics.flush().finally(() => {
+      if (db && db.open) {
+        try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch (_) {}
+        try { db.close(); } catch (_) {}
+      }
+      app.quit();
+    });
+    return;
+  }
   if (db && db.open) {
     try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch (_) {}
     try { db.close(); } catch (_) {}

@@ -1,0 +1,6 @@
+{"timestamp":"2026-11-25T20:35:00.000Z","level":"info","event":"diagnostics-initialized","details":{"retentionDays":14}}
+{"timestamp":"2026-11-25T20:35:00.000Z","level":"info","event":"application-start","details":{"appVersion":"0.3.0","platform":"win32","architecture":"x64","sample":true}}
+{"timestamp":"2026-11-25T20:35:00.000Z","level":"info","event":"navigation","details":{"screen":"reports","to":"reports"}}
+{"timestamp":"2026-11-25T20:35:00.000Z","level":"info","event":"report-generation-start","details":{"reportType":"profits","fromDate":"2026-11-01","toDate":"2026-11-25","records":18}}
+{"timestamp":"2026-11-25T20:35:00.000Z","level":"info","event":"modal-close","details":{"modal":"profit-entry","reason":"backdrop-click"}}
+{"timestamp":"2026-11-25T20:35:00.000Z","level":"info","event":"diagnostic-redaction-check","details":{"apiKey":"[redacted]","password":"[redacted]","note":"Example log with synthetic test data only."}}

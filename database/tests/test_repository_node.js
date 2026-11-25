@@ -95,7 +95,12 @@ function run() {
   assert.equal(itemReport.rows.length, 1);
   assert.equal(itemReport.totals.amount_milli, '15000');
   assert.equal(itemReport.totals.quantity_micros, '1500000');
-  assert.throws(() => repository.getProfitItemReport(database, '2026-11-23', '2026-11-23', []), /Select one or more items/);
+  const allItemsReport = repository.getProfitItemReport(database, '2026-11-23', '2026-11-23', []);
+  assert.equal(allItemsReport.rows.length, 1, 'An empty selection means all live items in the requested period.');
+  assert.deepEqual(allItemsReport.selected, ['صنف ألف معدل']);
+  assert.equal(allItemsReport.totals.amount_milli, '15000');
+  const multiItemReport = repository.getProfitItemReport(database, '2026-11-23', '2026-11-23', ['صنف ألف معدل', 'صنف إداري']);
+  assert.equal(multiItemReport.rows.length, 1, 'Multiple selected item names are supported, including catalog items without transactions.');
 
   const expenseReport = repository.getExpenseCategoryReport(database, '2026-11-23', '2026-11-23', [category.id]);
   assert.equal(expenseReport.rows.length, 1);

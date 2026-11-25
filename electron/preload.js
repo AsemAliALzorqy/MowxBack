@@ -13,6 +13,11 @@ contextBridge.exposeInMainWorld('mowx', Object.freeze({
   exportCustomReportPdf: (payload) => ipcRenderer.invoke('mowx:export-custom-report-pdf', payload),
   getAuditLog: (payload) => ipcRenderer.invoke('mowx:get-audit-log', payload),
   recordApplicationError: (payload) => ipcRenderer.invoke('mowx:record-application-error', payload),
+  recordDiagnosticLog: (payload) => ipcRenderer.invoke('mowx:record-diagnostic-log', payload),
+  getDiagnosticStatus: () => ipcRenderer.invoke('mowx:get-diagnostic-status'),
+  openDiagnosticFolder: () => ipcRenderer.invoke('mowx:open-diagnostic-folder'),
+  exportDiagnosticLogs: () => ipcRenderer.invoke('mowx:export-diagnostic-logs'),
+  setDiagnosticRetention: (payload) => ipcRenderer.invoke('mowx:set-diagnostic-retention', payload),
   searchNameSuggestions: (query) => ipcRenderer.invoke('mowx:search-name-suggestions', { query }),
 
   createProfitMovement: (payload) => ipcRenderer.invoke('mowx:create-profit-movement', payload),

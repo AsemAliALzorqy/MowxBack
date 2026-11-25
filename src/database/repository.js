@@ -733,20 +733,19 @@ function listReportOptions(db) {
   };
 }
 
-function getProfitItemReport(db, fromDate, toDate, itemNames) {
+function getProfitItemReport(db, fromDate, toDate, itemNames = []) {
   validateReportRange(fromDate, toDate);
-  if (!Array.isArray(itemNames) || itemNames.length < 1 || itemNames.length > 100) {
-    throw new Error('Select one or more items for the profit report.');
+  if (!Array.isArray(itemNames) || itemNames.length > 500) {
+    throw new Error('Invalid profit item selection.');
   }
   const names = [...new Set(itemNames.map((name) => normalizeName(name)).filter(Boolean))];
-  if (!names.length) throw new Error('Select one or more items for the profit report.');
-  const placeholders = names.map(() => '?').join(',');
+  const filterSql = names.length ? `AND pl.item_name IN (${names.map(() => '?').join(',')})` : '';
   const rows = db.prepare(`SELECT pl.id AS line_id, pl.transaction_id, pt.tx_date,
       pl.item_name, CAST(pl.quantity_micros AS TEXT) AS quantity_micros,
       CAST(pl.amount_milli AS TEXT) AS amount_milli, pl.notes
     FROM profit_lines pl JOIN profit_transactions pt ON pt.id=pl.transaction_id
     WHERE pt.deleted_at IS NULL AND pl.deleted_at IS NULL
-      AND pt.tx_date BETWEEN ? AND ? AND pl.item_name IN (${placeholders})
+      AND pt.tx_date BETWEEN ? AND ? ${filterSql}
     ORDER BY pt.tx_date, pl.item_name COLLATE NOCASE, pl.rowid`).all(fromDate, toDate, ...names);
   const byItemMap = new Map();
   const byDayMap = new Map();
@@ -763,7 +762,7 @@ function getProfitItemReport(db, fromDate, toDate, itemNames) {
     byDayMap.set(row.tx_date, day);
   }
   return {
-    type: 'profits', fromDate, toDate, selected: names,
+    type: 'profits', fromDate, toDate, selected: [...byItemMap.keys()].sort((a, b) => a.localeCompare(b, 'ar')),
     totals: {
       quantity_micros: sumIntegerStrings(rows.map((row) => row.quantity_micros)),
       amount_milli: sumIntegerStrings(rows.map((row) => row.amount_milli)),

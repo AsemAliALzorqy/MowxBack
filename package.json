@@ -1,6 +1,6 @@
 {
   "name": "mowxback",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "MowxBack — local Windows daily factory ledger",
   "main": "electron/main.js",
@@ -11,9 +11,11 @@
     "test:sqlite": "python database/tests/test_database.py",
     "test:repository": "node --no-warnings database/tests/test_repository_node.js",
     "test:bridge": "node database/tests/test_bridge_contract.js",
-    "test": "npm run test:money && npm run test:sqlite && npm run test:repository && npm run test:bridge && npm run test:reports",
+    "test": "npm run test:money && npm run test:sqlite && npm run test:repository && npm run test:bridge && npm run test:reports && npm run test:diagnostics && npm run test:dates",
     "dist:win": "npm run rebuild:native && electron-builder --win nsis --x64",
-    "test:reports": "node database/tests/test_report_template.js"
+    "test:reports": "node database/tests/test_report_template.js",
+    "test:diagnostics": "node database/tests/test_diagnostic_logger.js",
+    "test:dates": "node database/tests/test_report_dates.js"
   },
   "dependencies": {
     "better-sqlite3": "13.2.0"
