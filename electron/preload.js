@@ -18,6 +18,25 @@ contextBridge.exposeInMainWorld('mowx', Object.freeze({
   openDiagnosticFolder: () => ipcRenderer.invoke('mowx:open-diagnostic-folder'),
   exportDiagnosticLogs: () => ipcRenderer.invoke('mowx:export-diagnostic-logs'),
   setDiagnosticRetention: (payload) => ipcRenderer.invoke('mowx:set-diagnostic-retention', payload),
+  getTelegramStatus: () => ipcRenderer.invoke('mowx:telegram-status'),
+  verifyTelegramToken: (payload) => ipcRenderer.invoke('mowx:telegram-verify-token', payload),
+  saveTelegramToken: (payload) => ipcRenderer.invoke('mowx:telegram-save-token', payload),
+  setTelegramEnabled: (payload) => ipcRenderer.invoke('mowx:telegram-set-enabled', payload),
+  disconnectTelegram: () => ipcRenderer.invoke('mowx:telegram-disconnect'),
+  saveTelegramBusinessName: (payload) => ipcRenderer.invoke('mowx:telegram-save-business-name', payload),
+  createTelegramLink: (payload) => ipcRenderer.invoke('mowx:telegram-create-link', payload),
+  copyTelegramLink: (payload) => ipcRenderer.invoke('mowx:telegram-copy-link', payload),
+  showTelegramQr: (payload) => ipcRenderer.invoke('mowx:telegram-show-qr', payload),
+  openTelegramWhatsApp: (payload) => ipcRenderer.invoke('mowx:telegram-open-whatsapp', payload),
+  unlinkTelegramWorker: (payload) => ipcRenderer.invoke('mowx:telegram-unlink-worker', payload),
+  sendTelegramTestMessage: (payload) => ipcRenderer.invoke('mowx:telegram-test-message', payload),
+  retryTelegramNotification: (payload) => ipcRenderer.invoke('mowx:telegram-retry-notification', payload),
+  onTelegramLinkChanged: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const listener = () => callback();
+    ipcRenderer.on('mowx:telegram-link-changed', listener);
+    return () => ipcRenderer.removeListener('mowx:telegram-link-changed', listener);
+  },
   searchNameSuggestions: (query) => ipcRenderer.invoke('mowx:search-name-suggestions', { query }),
 
   createProfitMovement: (payload) => ipcRenderer.invoke('mowx:create-profit-movement', payload),

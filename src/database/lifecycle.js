@@ -10,6 +10,7 @@ function dbFingerprint(db) {
   const tables = [
     'items', 'workers', 'expense_categories', 'profit_transactions',
     'profit_lines', 'expenses', 'withdrawals', 'name_suggestions', 'audit_log',
+    'telegram_worker_links', 'telegram_link_tokens', 'telegram_notifications',
   ];
   const counts = {};
   const tableHashes = {};

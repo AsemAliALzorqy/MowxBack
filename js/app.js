@@ -29,6 +29,7 @@ const reportUi = {
 let reportOptionsData = null;
 let reportItemSearch = '';
 let diagnosticStatus = null;
+let telegramStatus = null;
 let modalPointerStartedOutside = false;
 let modalPointerEndedOutside = false;
 let auditQuery = '';
@@ -144,7 +145,17 @@ const V = {
   mgmt(kind) {
     const entries = (S[kind] || []).filter((item) => item.name.includes(q));
     const label = { items: 'صنف', workers: 'عامل', cats: 'تصنيف' }[kind];
-    return `<div class="bar"><label class="fld">بحث<input type="search" id="q" value="${esc(q)}" placeholder="ابحث بالاسم"></label><button class="btn p" data-act="madd" data-k="${kind}">${ic('plus')} إضافة ${label}</button></div><div class="card">${entries.length ? entries.map((item) => `<div class="row"><div class="m d">${esc(item.name)}</div><span class="badge ${item.active ? 'gain' : 'warn'}">${item.active ? 'نشط' : 'موقوف'}</span><button class="btn i" data-act="medit" data-k="${kind}" data-id="${esc(item.id)}" aria-label="تعديل">${ic('pencil')}</button><button class="btn" data-act="mtog" data-k="${kind}" data-id="${esc(item.id)}">${item.active ? 'إيقاف' : 'تفعيل'}</button></div>`).join('') : '<div class="empty">لا توجد نتائج</div>'}</div><div class="sub" style="margin-top:8px">الإيقاف لا يحذف السجلات السابقة.</div>`;
+    const rows = kind === 'workers' ? entries.map((item) => {
+      const link = item.telegram || { status: 'unlinked' };
+      const labels = { unlinked: 'غير مرتبط', pending: 'بانتظار الربط', expired: 'انتهت الصلاحية', linked: 'مرتبط' };
+      const cls = link.status === 'linked' ? 'gain' : link.status === 'pending' ? 'warn' : link.status === 'expired' ? 'loss' : '';
+      const share = link.status === 'linked'
+        ? `<button class="btn worker-manage" data-act="telegram-manage" data-id="${esc(item.id)}">إدارة الربط</button>`
+        : (telegramStatus?.active || S.telegram?.active) ? (item.active ? `<div class="worker-share-actions"><button class="btn" data-act="telegram-whatsapp" data-id="${esc(item.id)}" ${item.phone ? '' : 'disabled'} title="إرسال رابط الربط عبر WhatsApp">WhatsApp</button><button class="btn" data-act="telegram-qr" data-id="${esc(item.id)}">QR</button><button class="btn" data-act="telegram-copy" data-id="${esc(item.id)}">نسخ الرابط</button></div>` : '<span class="sub">فعّل العامل لإتاحة الربط</span>')
+          : '<span class="sub">فعّل Telegram من الإعدادات لإتاحة الربط</span>';
+      return `<div class="worker-entry"><div class="worker-entry-head"><div class="m"><b>${esc(item.name)}</b><small>${item.phone ? esc(item.phone) : 'لا يوجد رقم هاتف'}</small></div><span class="badge ${item.active ? 'gain' : 'warn'}">${item.active ? 'نشط' : 'موقوف'}</span><button class="btn i" data-act="medit" data-k="workers" data-id="${esc(item.id)}" aria-label="تعديل">${ic('pencil')}</button><button class="btn" data-act="mtog" data-k="workers" data-id="${esc(item.id)}">${item.active ? 'إيقاف' : 'تفعيل'}</button></div><div class="worker-telegram-line"><span class="worker-link-status ${cls}">${esc(labels[link.status] || 'غير مرتبط')}</span>${share}</div></div>`;
+    }).join('') : entries.map((item) => `<div class="row"><div class="m d">${esc(item.name)}</div><span class="badge ${item.active ? 'gain' : 'warn'}">${item.active ? 'نشط' : 'موقوف'}</span><button class="btn i" data-act="medit" data-k="${kind}" data-id="${esc(item.id)}" aria-label="تعديل">${ic('pencil')}</button><button class="btn" data-act="mtog" data-k="${kind}" data-id="${esc(item.id)}">${item.active ? 'إيقاف' : 'تفعيل'}</button></div>`).join('');
+    return `<div class="bar"><label class="fld">بحث<input type="search" id="q" value="${esc(q)}" placeholder="ابحث بالاسم"></label><button class="btn p" data-act="madd" data-k="${kind}">${ic('plus')} إضافة ${label}</button></div><div class="card">${rows || '<div class="empty">لا توجد نتائج</div>'}</div><div class="sub" style="margin-top:8px">الإيقاف لا يحذف السجلات السابقة.${kind === 'workers' ? ' · ربط Telegram اختياري، ويتطلب تفعيل البوت من الإعدادات.' : ''}</div>`;
   },
   settings() {
     const runtime = S.runtime || {};
@@ -153,8 +164,12 @@ const V = {
     const filteredLog = normalizedQuery ? log.filter((entry) => auditSearchText(entry).includes(normalizedQuery)) : log;
     const entries = filteredLog.map(auditEntryMarkup).join('');
     const diagnostics = diagnosticStatus || { enabled: true, fileCount: 0, retentionDays: 14, directory: 'جارٍ قراءة الحالة…' };
+    const telegram = telegramStatus || { enabled: false, configured: false, active: false, botUsername: '', businessName: '', workers: [], notifications: [] };
+    const linkedWorkers = (telegram.workers || []).filter((worker) => worker.telegram.status === 'linked');
+    const notificationRows = (telegram.notifications || []).map((entry) => `<div class="telegram-history-row"><div><b>${esc(entry.withdrawal_id)}</b><small>${esc(entry.status === 'sent' ? 'تم الإرسال' : entry.status === 'pending' ? 'بانتظار الإرسال' : entry.status === 'failed' ? 'فشل الإرسال' : entry.status === 'cancelled' ? 'ملغى' : 'قيد الإرسال')} · ${esc(new Date(entry.created_at).toLocaleString('ar-JO'))}</small>${entry.last_error ? `<small class="loss">${esc(entry.last_error)}</small>` : ''}</div>${entry.status === 'failed' ? `<button class="btn" data-act="telegram-retry" data-id="${esc(entry.id)}">إعادة المحاولة</button>` : ''}</div>`).join('');
+    const telegramCard = `<h2>ربط Telegram والإشعارات</h2><div class="card telegram-settings"><div class="row"><div class="m"><b>حالة البوت</b><div class="sub">${telegram.enabled ? (telegram.active ? 'التشغيل المحلي للبوت نشط؛ يعيد الاتصال تلقائياً عند الانقطاع' : 'مفعّل لكن الاستقبال متوقف') : 'غير مفعل — يمكنك استخدام البرنامج بشكل طبيعي دون Telegram'}</div></div><span class="badge ${telegram.active ? 'gain' : 'warn'}">${telegram.active ? 'يعمل' : telegram.configured ? 'غير نشط' : 'غير معد'}</span></div>${telegram.botUsername ? `<div class="sub">البوت: @${esc(telegram.botUsername)} · العمال المرتبطون: ${fmtNum(telegram.linkedWorkers || 0, 0)}</div>` : ''}<div class="sub">آخر تحقق من الاتصال: ${telegram.verifiedAt ? esc(new Date(telegram.verifiedAt).toLocaleString('ar-JO')) : 'لم يتم التحقق بعد'}</div>${telegram.error ? `<div class="telegram-error">${esc(telegram.error)}</div>` : ''}<label class="fld">Bot Token<input id="telegramToken" type="password" autocomplete="new-password" placeholder="أدخل Token من BotFather — لا يتم عرضه بعد الحفظ"></label><div class="btns"><button class="btn" data-act="telegram-verify">التحقق من الرمز</button><button class="btn p" data-act="telegram-save-token">حفظ وربط البوت</button></div><div class="sub">أنشئ بوتاً خاصاً بك من @BotFather باستخدام /newbot، ثم أدخل الرمز هنا. يُحفظ الرمز مشفراً محلياً ولا يُرسل إلى GitHub.</div><div class="btns"><button class="btn" data-act="telegram-enable" ${telegram.active ? 'disabled' : ''}>تفعيل الإشعارات</button><button class="btn" data-act="telegram-disable" ${!telegram.enabled ? 'disabled' : ''}>تعطيل الإشعارات</button><button class="btn" data-act="telegram-disconnect" ${!telegram.configured ? 'disabled' : ''}>فصل البوت وحذف بيانات الربط</button></div><div class="telegram-separator"></div><b>هوية الإشعارات</b><label class="fld">اسم المنشأة (اختياري)<input id="telegramBusinessName" maxlength="120" value="${esc(telegram.businessName || '')}" placeholder="مثال: مصنع النور"></label><button class="btn" data-act="telegram-save-business">حفظ اسم المنشأة</button><div class="telegram-separator"></div><b>اختبار إرسال رسالة</b><label class="fld">العامل المرتبط<select id="telegramTestWorker"><option value="">اختر عاملاً</option>${linkedWorkers.map((worker) => `<option value="${esc(worker.id)}">${esc(worker.name)}</option>`).join('')}</select></label><button class="btn" data-act="telegram-test-message" ${!telegram.active || !linkedWorkers.length ? 'disabled' : ''}>إرسال رسالة اختبارية</button><div class="telegram-separator"></div><b>سجل الإشعارات الأخيرة</b>${notificationRows || '<div class="empty">لا توجد إشعارات مسجلة بعد.</div>'}</div>`;
     const hasMore = log.length < Number(S.auditLogCount || log.length);
-    return `<div class="card"><label class="fld">العملة<select id="curCode">${Object.entries(CURS).map(([code, symbol]) => `<option value="${code}"${S.currencyCode === code ? ' selected' : ''}>${code} — ${symbol}</option>`).join('')}<option value="custom"${S.currencyCode === 'custom' ? ' selected' : ''}>أخرى (نص مخصص)</option></select></label><label class="fld">النص المخصص (عند اختيار أخرى)<input id="cur" value="${esc(S.currency)}" maxlength="12"></label><button class="btn p" data-act="cur">حفظ العملة</button></div>${backupCard(runtime)}<h2>الإدارة</h2><div class="btns"><button class="btn" data-go="items">${ic('package')} الأصناف</button><button class="btn" data-go="workers">${ic('users')} العمال</button><button class="btn" data-act="cats">${ic('receipt')} تصنيفات المصروفات</button></div>
+    return `<div class="card"><label class="fld">العملة<select id="curCode">${Object.entries(CURS).map(([code, symbol]) => `<option value="${code}"${S.currencyCode === code ? ' selected' : ''}>${code} — ${symbol}</option>`).join('')}<option value="custom"${S.currencyCode === 'custom' ? ' selected' : ''}>أخرى (نص مخصص)</option></select></label><label class="fld">النص المخصص (عند اختيار أخرى)<input id="cur" value="${esc(S.currency)}" maxlength="12"></label><button class="btn p" data-act="cur">حفظ العملة</button></div>${telegramCard}${backupCard(runtime)}<h2>الإدارة</h2><div class="btns"><button class="btn" data-go="items">${ic('package')} الأصناف</button><button class="btn" data-go="workers">${ic('users')} العمال</button><button class="btn" data-act="cats">${ic('receipt')} تصنيفات المصروفات</button></div>
       <div class="audit-heading"><div><h2>سجل التغييرات</h2><div class="sub">سجل تدقيق محلي متسلسل للعمليات التي تمت على بيانات النظام وإعداداته.</div></div><span class="badge">${fmtNum(S.auditLogCount || log.length, 0)} سجل</span></div>
       <div class="card audit-card"><div class="audit-notice">${ic('check','s')} سجل للقراءة فقط. لا يمكن تعديل السجلات أو حذفها من داخل التطبيق، وتُحفظ تفاصيل العملية السابقة واللاحقة عند توفرها.</div><label class="fld">البحث في السجل<input id="auditSearch" type="search" value="${esc(auditQuery)}" placeholder="ابحث باسم أو نوع عملية أو رقم سجل"></label>${entries || '<div class="empty">لا توجد سجلات مطابقة.</div>'}${hasMore ? `<button class="btn audit-more" data-act="audit-more" ${auditLoading ? 'disabled' : ''}>${auditLoading ? 'جارٍ تحميل السجلات…' : 'عرض سجلات أقدم'}</button>` : ''}</div>
       <h2>سجلات التشخيص</h2><div class="card diagnostic-card"><div class="row"><div class="m"><b>حالة التسجيل</b><div class="sub">${diagnostics.enabled ? 'مفعّل — يسجل أحداث التشغيل والأخطاء والعمليات دون قيم الحقول الحساسة' : 'متوقف'}</div></div><span class="badge ${diagnostics.enabled ? 'gain' : 'warn'}">${diagnostics.enabled ? 'نشط' : 'متوقف'}</span></div><div class="sub">آخر تسجيل: ${esc(diagnostics.lastEntryAt ? new Date(diagnostics.lastEntryAt).toLocaleString('ar-JO') : 'لا يوجد بعد')}<br>عدد ملفات السجل: ${fmtNum(diagnostics.fileCount, 0)}<br>مسار السجلات: ${esc(diagnostics.directory || 'غير متاح')}</div><label class="fld">مدة الاحتفاظ بالسجلات<select id="diagRetention">${[7,14,30,60].map((days) => `<option value="${days}"${Number(diagnostics.retentionDays) === days ? ' selected' : ''}>${days} يوماً</option>`).join('')}</select></label><div class="btns"><button class="btn" data-act="diag-open">فتح مجلد السجلات</button><button class="btn p" data-act="diag-export">تصدير السجلات للمشاركة</button></div></div><h2>معلومات النظام</h2><div class="card sub">MowxBack — تخزين محلي عبر SQLite. إصدار التطبيق: ${esc(runtime.appVersion || 'غير متاح')}<br>إصدار قاعدة البيانات: ${esc(runtime.databaseVersion ?? '')}<br>مسار القاعدة: ${esc(runtime.databasePath || 'غير متاح')}<br>الفحص: ${runtime.integrityOk ? 'سليم' : 'لم يُفحص بعد أو توجد مشكلة'}<br>لا توجد مزامنة أو اتصال سحابي.</div>`;
@@ -282,6 +297,8 @@ async function render() {
   if (page === 'settings') {
     try { diagnosticStatus = await Store.diagnosticStatus(); }
     catch (error) { diagnosticStatus = { enabled: false, fileCount: 0, directory: 'تعذر قراءة الحالة', retentionDays: 14 }; console.error('Diagnostic status unavailable:', error); }
+    try { telegramStatus = await Store.telegramStatus(); }
+    catch (error) { telegramStatus = { enabled: false, configured: false, active: false, workers: [], notifications: [], error: error.message }; }
     if (sequence !== renderSequence) return;
   }
   if (page === 'reports') {
@@ -394,11 +411,13 @@ function txForm(transaction) {
 
 function catalogForm(kind, item) {
   const isNew = !item;
-  form(isNew ? 'إضافة' : 'تعديل', [{ k: 'name', l: 'الاسم', r: true }], item || {}, async (values) => {
+  const fields = [{ k: 'name', l: 'الاسم', r: true }];
+  if (kind === 'workers') fields.push({ k: 'phone', l: 'رقم الهاتف (اختياري — يفضّل مع رمز الدولة)', t: 'tel' });
+  form(isNew ? 'إضافة' : 'تعديل', fields, item || {}, async (values) => {
     if ((S[kind] || []).some((entry) => entry.name.trim() === values.name && (!item || entry.id !== item.id))) {
       toast('الاسم موجود مسبقاً', 'err'); return;
     }
-    await Store.saveCatalog({ kind, id: item?.id, name: values.name });
+    await Store.saveCatalog({ kind, id: item?.id, name: values.name, phone: values.phone || '' });
     closeM(); await refreshState(); toast('تم الحفظ');
   });
 }
@@ -635,6 +654,45 @@ document.addEventListener('click', async (event) => {
       $('modal').hidden = false;
       $('modal').innerHTML = `<div class="sheet"><h3>المزيد</h3><div class="grid">${PAGES.filter((entry) => !MAIN.includes(entry[0])).map((entry) => `<button class="btn" data-go="${entry[0]}">${ic(entry[2])}${entry[1]}</button>`).join('')}<button class="btn" id="fc2">إغلاق</button></div></div>`;
       $('fc2').onclick = () => closeM('close-button');
+    } else if (act === 'telegram-verify') {
+      const result = await Store.verifyTelegramToken({ token: $('telegramToken')?.value || '' });
+      toast(result.hasWebhook ? `الرمز صحيح (@${result.username}) لكن يوجد Webhook يحتاج إلى إزالته` : `الرمز صحيح — @${result.username}` , result.hasWebhook ? 'err' : 'ok');
+    } else if (act === 'telegram-save-token') {
+      const token = $('telegramToken')?.value || '';
+      if (!token.trim()) throw new Error('أدخل Bot Token أولاً.');
+      telegramStatus = await Store.saveTelegramToken({ token });
+      if ($('telegramToken')) $('telegramToken').value = '';
+      S = await Store.load(); await render(); toast('تم حفظ البوت وتفعيل إشعارات Telegram');
+    } else if (act === 'telegram-enable') {
+      telegramStatus = await Store.setTelegramEnabled({ enabled: true }); S = await Store.load(); await render(); toast('تم تفعيل إشعارات Telegram');
+    } else if (act === 'telegram-disable') {
+      if (!confirm('سيتم إيقاف الإشعارات وإلغاء الرسائل المعلقة. هل تريد المتابعة؟')) return;
+      telegramStatus = await Store.setTelegramEnabled({ enabled: false }); S = await Store.load(); await render(); toast('تم تعطيل إشعارات Telegram');
+    } else if (act === 'telegram-disconnect') {
+      if (!confirm('سيتم حذف Bot Token المحفوظ وفصل جميع العمال وإلغاء الإشعارات المعلقة. هل تريد المتابعة؟')) return;
+      telegramStatus = await Store.disconnectTelegram(); S = await Store.load(); await render(); toast('تم فصل البوت وحذف بيانات اعتماده وربط العمال');
+    } else if (act === 'telegram-save-business') {
+      telegramStatus = await Store.saveTelegramBusinessName({ name: $('telegramBusinessName')?.value || '' }); await render(); toast('تم حفظ اسم المنشأة');
+    } else if (act === 'telegram-test-message') {
+      const workerId = $('telegramTestWorker')?.value || ''; if (!workerId) throw new Error('اختر عاملاً مرتبطاً أولاً.');
+      await Store.sendTelegramTestMessage({ workerId }); toast('تم إرسال الرسالة الاختبارية');
+    } else if (act === 'telegram-copy') {
+      await Store.copyTelegramLink({ workerId: id }); toast('تم نسخ رابط الربط. صلاحيته 10 دقائق.'); await refreshState();
+    } else if (act === 'telegram-whatsapp') {
+      await Store.openTelegramWhatsApp({ workerId: id }); toast('تم فتح محادثة WhatsApp مع رسالة جاهزة؛ اضغط إرسال من WhatsApp.');
+    } else if (act === 'telegram-qr') {
+      const result = await Store.showTelegramQr({ workerId: id });
+      $('modal').hidden = false; $('modal').innerHTML = `<div class="sheet telegram-qr-sheet" role="dialog" aria-label="رمز ربط Telegram"><h3>ربط العامل عبر QR</h3><p class="sub">${esc(result.workerName)}</p><img class="telegram-qr-image" alt="رمز QR لرابط Telegram" src="${result.dataUrl}"><p class="sub">وجّه كاميرا الهاتف إلى الرمز لفتح البوت، ثم اضغط Start.</p><p class="sub">تنتهي صلاحية الرابط: ${new Date(result.expiresAt).toLocaleTimeString('ar-JO')}</p><button class="btn" id="telegramQrClose">إغلاق</button></div>`;
+      $('telegramQrClose').onclick = () => closeM('close-button');
+    } else if (act === 'telegram-manage') {
+      const worker = S.workers.find((entry) => entry.id === id); const link = worker?.telegram || {};
+      $('modal').hidden = false; $('modal').innerHTML = `<div class="sheet" role="dialog" aria-label="إدارة ربط Telegram"><h3>إدارة ربط Telegram</h3><p><b>${esc(worker?.name || '')}</b></p><p class="sub">الحالة: مرتبط${link.username ? ` · @${esc(link.username)}` : ''}</p><p class="sub">تاريخ الربط: ${link.linkedAt ? esc(new Date(link.linkedAt).toLocaleString('ar-JO')) : 'غير متاح'}</p><div class="btns"><button class="btn p" id="telegramRelink">إعادة ربط الحساب</button><button class="btn" id="telegramUnlink">فصل الربط</button><button class="btn" id="telegramManageClose">إغلاق</button></div></div>`;
+      $('telegramManageClose').onclick = () => closeM('close-button');
+      $('telegramUnlink').onclick = async () => { if (!confirm('هل تريد فصل حساب Telegram عن هذا العامل؟')) return; await Store.unlinkTelegramWorker({ workerId: id }); closeM(); await refreshState(); toast('تم فصل حساب Telegram'); };
+      $('telegramRelink').onclick = async () => { if (!confirm('سيتم فصل الحساب الحالي وإنشاء رابط ربط جديد. هل تريد المتابعة؟')) return; await Store.unlinkTelegramWorker({ workerId: id }); await refreshState(); const qrResult = await Store.showTelegramQr({ workerId: id }); $('modal').hidden = false; $('modal').innerHTML = `<div class="sheet telegram-qr-sheet" role="dialog" aria-label="إعادة ربط Telegram"><h3>إعادة ربط Telegram</h3><p class="sub">${esc(qrResult.workerName)}</p><img class="telegram-qr-image" alt="رمز QR لرابط Telegram" src="${qrResult.dataUrl}"><p class="sub">امسح الرمز من هاتف العامل ثم اضغط Start.</p><button class="btn" id="telegramQrClose">إغلاق</button></div>`; $('telegramQrClose').onclick = () => closeM('close-button'); };
+    } else if (act === 'telegram-retry') {
+      const result = await Store.retryTelegramNotification({ id }); if (!result.queued) throw new Error('لم يعد الإشعار قابلاً لإعادة المحاولة.');
+      telegramStatus = await Store.telegramStatus(); await render(); toast('تمت إعادة الإشعار إلى قائمة الإرسال');
     } else if (act === 'report-type') { reportUi.type = type; reportUi.preview = null; await render(); }
     else if (act === 'report-preview') {
       const payload = reportPayload();
@@ -726,6 +784,13 @@ modalSurface.addEventListener('click', (event) => {
   if (shouldClose) closeM('backdrop-click');
 });
 document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !$('modal').hidden) closeM('escape-key'); });
+
+if (typeof Store.onTelegramLinkChanged === 'function') {
+  Store.onTelegramLinkChanged(async () => {
+    try { S = await Store.load(); if (page === 'settings') telegramStatus = await Store.telegramStatus(); await render(); }
+    catch (error) { console.error('Telegram worker status refresh failed:', error); }
+  });
+}
 
 (async function startApplication() {
   try {

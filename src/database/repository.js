@@ -217,6 +217,31 @@ function createWithdrawal(db, payload) {
   const create = db.transaction(() => {
     db.prepare(`INSERT INTO withdrawals(id,tx_date,worker_id,worker_name_snapshot,amount_milli,notes,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?,?)`).run(id, row.date, row.workerId, row.workerName, row.amountMilli, row.notes, at, at);
+
+    // Notification outbox entry is committed atomically with the withdrawal.
+    // Telegram never participates in the financial transaction itself.
+    const settings = getAppSettings(db);
+    if (settings.telegramEnabled === true) {
+      const link = db.prepare('SELECT chat_id FROM telegram_worker_links WHERE worker_id=?').get(worker.id);
+      if (link) {
+        const payload = {
+          withdrawalId: id,
+          workerName: worker.name,
+          date: row.date,
+          createdAt: at,
+          amountMilli: row.amountMilli,
+          notes: row.notes,
+          currencyLabel: settings.currencyCode === 'SAR' ? '\u20C1' : (settings.currencyLabel || ''),
+          decimalPlaces: Number.isInteger(settings.currencyDecimalPlaces) ? settings.currencyDecimalPlaces : 2,
+          businessName: String(settings.telegramBusinessName || '').trim(),
+        };
+        db.prepare(`INSERT INTO telegram_notifications
+          (id,withdrawal_id,worker_id,chat_id,payload_json,status,attempts,next_attempt_at,created_at)
+          VALUES(?,?,?,?,?,'pending',0,?,?)`)
+          .run(makeId('telegram-notification'), id, worker.id, link.chat_id, JSON.stringify(payload), at, at);
+      }
+    }
+
     audit(db, { entityType: 'withdrawal', entityId: id, action: 'create', after: row, at });
     return row;
   });
@@ -315,12 +340,16 @@ function saveCatalogEntry(db, kind, payload) {
   const name = normalizeName(payload.name);
   if (!name) throw new Error('A catalog name is required.');
   const id = payload.id || makeId(kind);
+  const phone = kind === 'worker' ? String(payload.phone ?? '').trim() : '';
+  if (phone.length > 40 || /[\r\n\u0000-\u001f]/.test(phone)) throw new Error('Worker phone number is invalid.');
   const save = db.transaction(() => {
     const before = db.prepare(`SELECT * FROM ${table} WHERE id=?`).get(id) || null;
     if (before) {
-      db.prepare(`UPDATE ${table} SET name=?, updated_at=? WHERE id=?`).run(name, at, id);
+      if (kind === 'worker') db.prepare(`UPDATE ${table} SET name=?,phone=?,updated_at=? WHERE id=?`).run(name, phone, at, id);
+      else db.prepare(`UPDATE ${table} SET name=?, updated_at=? WHERE id=?`).run(name, at, id);
     } else {
-      db.prepare(`INSERT INTO ${table}(id,name,is_active,created_at,updated_at) VALUES(?,?,1,?,?)`).run(id, name, at, at);
+      if (kind === 'worker') db.prepare(`INSERT INTO ${table}(id,name,phone,is_active,created_at,updated_at) VALUES(?,?,?,1,?,?)`).run(id, name, phone, at, at);
+      else db.prepare(`INSERT INTO ${table}(id,name,is_active,created_at,updated_at) VALUES(?,?,1,?,?)`).run(id, name, at, at);
     }
     const after = db.prepare(`SELECT * FROM ${table} WHERE id=?`).get(id);
     audit(db, { entityType: kind, entityId: id, action: before ? 'update' : 'create', before, after, at });
@@ -361,12 +390,13 @@ function searchNameSuggestions(db, input, limit = 8) {
 function listCatalogEntries(db, kind, includeInactive = true) {
   const table = CATALOG_TABLES[kind];
   if (!table) throw new Error('Unknown catalog type.');
-  return db.prepare(`SELECT id, name, is_active, created_at, updated_at
+  const columns = kind === 'worker' ? 'id, name, phone, is_active, created_at, updated_at' : 'id, name, is_active, created_at, updated_at';
+  return db.prepare(`SELECT ${columns}
     FROM ${table} WHERE deleted_at IS NULL AND (? = 1 OR is_active = 1)
     ORDER BY name COLLATE NOCASE, id`).all(includeInactive ? 1 : 0);
 }
 
-const APP_SETTING_KEYS = new Set(['currencyCode', 'currencyLabel', 'currencyDecimalPlaces', 'legacyDemoFlag']);
+const APP_SETTING_KEYS = new Set(['currencyCode', 'currencyLabel', 'currencyDecimalPlaces', 'legacyDemoFlag', 'telegramEnabled', 'telegramBusinessName', 'telegramBotUsername', 'telegramVerifiedAt']);
 
 function getAppSettings(db) {
   const result = {};
@@ -388,6 +418,10 @@ function setAppSetting(db, key, value) {
   if (key === 'currencyDecimalPlaces' && (!Number.isInteger(value) || value < 0 || value > 3)) {
     throw new Error('Currency precision must be an integer from 0 to 3.');
   }
+  if (key === 'telegramEnabled' && typeof value !== 'boolean') throw new Error('Telegram enabled state must be boolean.');
+  if (key === 'telegramBusinessName' && (typeof value !== 'string' || value.length > 120)) throw new Error('Business name must not exceed 120 characters.');
+  if (key === 'telegramBotUsername' && (typeof value !== 'string' || value.length > 64)) throw new Error('Telegram bot username is invalid.');
+  if (key === 'telegramVerifiedAt' && (typeof value !== 'string' || Number.isNaN(Date.parse(value)))) throw new Error('Telegram verification timestamp is invalid.');
   const at = utcNow();
   const save = db.transaction(() => {
     const beforeRow = db.prepare('SELECT value_json FROM app_settings WHERE setting_key=?').get(key);
@@ -401,6 +435,159 @@ function setAppSetting(db, key, value) {
     return value;
   });
   return save();
+}
+
+function listTelegramWorkerStates(db) {
+  const now = utcNow();
+  return db.prepare(`SELECT w.id,w.name,w.phone,w.is_active,
+      l.chat_id,l.username,l.first_name,l.last_name,l.linked_at,
+      (SELECT MAX(t.created_at) FROM telegram_link_tokens t WHERE t.worker_id=w.id AND t.consumed_at IS NULL AND t.invalidated_at IS NULL) AS last_token_created_at,
+      (SELECT MAX(t.expires_at) FROM telegram_link_tokens t WHERE t.worker_id=w.id AND t.consumed_at IS NULL AND t.invalidated_at IS NULL) AS last_token_expires_at
+    FROM workers w LEFT JOIN telegram_worker_links l ON l.worker_id=w.id
+    WHERE w.deleted_at IS NULL ORDER BY w.name COLLATE NOCASE,w.id`).all().map((row) => {
+      let status = 'unlinked';
+      if (row.chat_id) status = 'linked';
+      else if (row.last_token_expires_at && row.last_token_expires_at > now) status = 'pending';
+      else if (row.last_token_expires_at) status = 'expired';
+      return { id: row.id, name: row.name, phone: row.phone || '', active: Boolean(row.is_active),
+        telegram: { status, username: row.username || '', firstName: row.first_name || '',
+          lastName: row.last_name || '', linkedAt: row.linked_at || null,
+          tokenCreatedAt: row.last_token_created_at || null, tokenExpiresAt: row.last_token_expires_at || null } };
+    });
+}
+
+function createTelegramLinkToken(db, { workerId, tokenHash, tokenEncrypted, expiresAt }) {
+  if (!/^[a-f0-9]{64}$/i.test(tokenHash) || typeof tokenEncrypted !== 'string' || !tokenEncrypted) throw new Error('Invalid Telegram link token.');
+  const at = utcNow();
+  const create = db.transaction(() => {
+    const worker = db.prepare('SELECT id,name,is_active FROM workers WHERE id=? AND deleted_at IS NULL').get(workerId);
+    if (!worker) throw new Error('Worker was not found.');
+    if (!worker.is_active) throw new Error('لا يمكن ربط عامل موقوف. فعّل العامل أولاً.');
+    if (db.prepare('SELECT 1 FROM telegram_worker_links WHERE worker_id=?').get(workerId)) {
+      throw new Error('العامل مرتبط بالفعل. افتح إدارة الربط لفصل الحساب أو مراجعة بياناته.');
+    }
+    db.prepare(`UPDATE telegram_link_tokens SET invalidated_at=?
+      WHERE worker_id=? AND consumed_at IS NULL AND invalidated_at IS NULL`).run(at, workerId);
+    db.prepare(`INSERT INTO telegram_link_tokens(token_hash,token_encrypted,worker_id,created_at,expires_at)
+      VALUES(?,?,?,?,?)`).run(tokenHash, tokenEncrypted, workerId, at, expiresAt);
+    return { workerId, workerName: worker.name, createdAt: at, expiresAt };
+  });
+  return create();
+}
+
+function getActiveTelegramLinkToken(db, workerId, now = utcNow()) {
+  return db.prepare(`SELECT token_hash,token_encrypted,expires_at FROM telegram_link_tokens
+    WHERE worker_id=? AND consumed_at IS NULL AND invalidated_at IS NULL AND expires_at>?
+    ORDER BY created_at DESC LIMIT 1`).get(workerId, now) || null;
+}
+
+function completeTelegramLink(db, { tokenHash, chatId, username = '', firstName = '', lastName = '' }) {
+  if (!/^[a-f0-9]{64}$/i.test(tokenHash)) throw new Error('Invalid Telegram link token.');
+  const normalizedChatId = String(chatId || '');
+  if (!/^-?\d{1,24}$/.test(normalizedChatId)) throw new Error('Invalid Telegram private chat identifier.');
+  const at = utcNow();
+  const complete = db.transaction(() => {
+    const token = db.prepare(`SELECT token_hash,worker_id,expires_at,consumed_at,invalidated_at
+      FROM telegram_link_tokens WHERE token_hash=?`).get(tokenHash);
+    if (!token || token.consumed_at || token.invalidated_at || token.expires_at <= at) {
+      throw new Error('رابط الربط غير صالح أو انتهت صلاحيته. اطلب رابطاً جديداً من مسؤول النظام.');
+    }
+    const worker = db.prepare('SELECT id,name,is_active FROM workers WHERE id=? AND deleted_at IS NULL').get(token.worker_id);
+    if (!worker || !worker.is_active) throw new Error('العامل غير متاح للربط حالياً.');
+    const existingChat = db.prepare('SELECT worker_id FROM telegram_worker_links WHERE chat_id=?').get(normalizedChatId);
+    if (existingChat && existingChat.worker_id !== worker.id) throw new Error('حساب Telegram هذا مرتبط بعامل آخر بالفعل.');
+    const existingWorker = db.prepare('SELECT chat_id FROM telegram_worker_links WHERE worker_id=?').get(worker.id);
+    if (existingWorker && existingWorker.chat_id !== normalizedChatId) throw new Error('العامل مرتبط بحساب Telegram آخر. افصل الربط الحالي أولاً.');
+    db.prepare(`INSERT INTO telegram_worker_links(worker_id,chat_id,username,first_name,last_name,linked_at)
+      VALUES(?,?,?,?,?,?) ON CONFLICT(worker_id) DO UPDATE SET
+      chat_id=excluded.chat_id,username=excluded.username,first_name=excluded.first_name,
+      last_name=excluded.last_name,linked_at=excluded.linked_at`)
+      .run(worker.id, normalizedChatId, String(username).slice(0,64), String(firstName).slice(0,120), String(lastName).slice(0,120), at);
+    db.prepare('UPDATE telegram_link_tokens SET consumed_at=? WHERE token_hash=?').run(at, tokenHash);
+    return { workerId: worker.id, workerName: worker.name, chatId: normalizedChatId, username: String(username).slice(0,64), linkedAt: at };
+  });
+  return complete();
+}
+
+function unlinkTelegramWorker(db, workerId) {
+  const at = utcNow();
+  const unlink = db.transaction(() => {
+    const row = db.prepare('SELECT chat_id FROM telegram_worker_links WHERE worker_id=?').get(workerId);
+    if (!row) return { unlinked: false };
+    db.prepare('DELETE FROM telegram_worker_links WHERE worker_id=?').run(workerId);
+    db.prepare(`UPDATE telegram_link_tokens SET invalidated_at=?
+      WHERE worker_id=? AND consumed_at IS NULL AND invalidated_at IS NULL`).run(at, workerId);
+    db.prepare(`UPDATE telegram_notifications SET status='cancelled',last_error='تم فصل ربط العامل قبل الإرسال'
+      WHERE worker_id=? AND status IN ('pending','sending')`).run(workerId);
+    return { unlinked: true };
+  });
+  return unlink();
+}
+
+function listPendingTelegramNotifications(db, now = utcNow(), limit = 10) {
+  const safeLimit = Math.min(Math.max(Number.isInteger(limit) ? limit : 10, 1), 50);
+  return db.prepare(`SELECT id,withdrawal_id,worker_id,chat_id,payload_json,attempts
+    FROM telegram_notifications WHERE status='pending' AND next_attempt_at<=?
+    ORDER BY created_at,id LIMIT ?`).all(now, safeLimit).map((row) => ({
+      id: row.id, withdrawalId: row.withdrawal_id, workerId: row.worker_id,
+      chatId: row.chat_id, payload: JSON.parse(row.payload_json), attempts: row.attempts,
+    }));
+}
+
+function markTelegramNotificationSending(db, id) {
+  const at = utcNow();
+  return db.prepare(`UPDATE telegram_notifications SET status='sending',attempts=attempts+1,last_attempt_at=?,last_error=NULL
+    WHERE id=? AND status='pending'`).run(at, id).changes === 1;
+}
+
+function markTelegramNotificationSent(db, id, messageId) {
+  const at = utcNow();
+  db.prepare(`UPDATE telegram_notifications SET status='sent',sent_at=?,telegram_message_id=?,last_error=NULL
+    WHERE id=? AND status='sending'`).run(at, String(messageId || ''), id);
+}
+
+function markTelegramNotificationRetry(db, id, error, nextAttemptAt, maxAttempts = 7) {
+  const row = db.prepare('SELECT attempts FROM telegram_notifications WHERE id=?').get(id);
+  if (!row) return;
+  const status = row.attempts >= maxAttempts ? 'failed' : 'pending';
+  db.prepare(`UPDATE telegram_notifications SET status=?,next_attempt_at=?,last_error=? WHERE id=?`)
+    .run(status, nextAttemptAt, String(error || 'Unknown Telegram error').slice(0, 500), id);
+}
+
+function recoverTelegramSending(db) {
+  // A process restart can occur after Telegram accepted a message but before SQLite
+  // recorded the response. Keep this state for operator review instead of blindly resending.
+  const at = utcNow();
+  return db.prepare(`UPDATE telegram_notifications SET status='failed',last_error='توقف التطبيق أثناء محاولة الإرسال؛ راجع سجل الإشعار قبل إعادة المحاولة'
+    WHERE status='sending'`).run().changes;
+}
+
+function clearTelegramLinks(db) {
+  const at = utcNow();
+  const clear = db.transaction(() => {
+    db.prepare('DELETE FROM telegram_worker_links').run();
+    db.prepare(`UPDATE telegram_link_tokens SET invalidated_at=? WHERE consumed_at IS NULL AND invalidated_at IS NULL`).run(at);
+    db.prepare(`UPDATE telegram_notifications SET status='cancelled',last_error='تم تغيير بوت Telegram؛ أُلغيت الرسائل المعلقة'
+      WHERE status IN ('pending','sending')`).run();
+  });
+  clear();
+}
+
+function cancelPendingTelegramNotifications(db) {
+  return db.prepare(`UPDATE telegram_notifications SET status='cancelled',last_error='إشعارات Telegram معطلة من الإعدادات'
+    WHERE status='pending'`).run().changes;
+}
+
+function retryTelegramNotification(db, id) {
+  const at = utcNow();
+  return db.prepare(`UPDATE telegram_notifications SET status='pending',next_attempt_at=?,last_error=NULL
+    WHERE id=? AND status='failed'`).run(at, id).changes === 1;
+}
+
+function listTelegramNotificationHistory(db, limit = 30) {
+  const safeLimit = Math.min(Math.max(Number.isInteger(limit) ? limit : 30, 1), 100);
+  return db.prepare(`SELECT id,withdrawal_id,worker_id,status,attempts,created_at,last_attempt_at,sent_at,telegram_message_id,last_error
+    FROM telegram_notifications ORDER BY created_at DESC,id DESC LIMIT ?`).all(safeLimit);
 }
 
 function setCurrencySettings(db, { code, label, decimalPlaces }) {
@@ -885,6 +1072,20 @@ module.exports = {
   getAppSettings,
   setAppSetting,
   setCurrencySettings,
+  listTelegramWorkerStates,
+  createTelegramLinkToken,
+  getActiveTelegramLinkToken,
+  completeTelegramLink,
+  unlinkTelegramWorker,
+  listPendingTelegramNotifications,
+  markTelegramNotificationSending,
+  markTelegramNotificationSent,
+  markTelegramNotificationRetry,
+  recoverTelegramSending,
+  clearTelegramLinks,
+  cancelPendingTelegramNotifications,
+  retryTelegramNotification,
+  listTelegramNotificationHistory,
   searchNameSuggestions,
   listTransactions,
   getDailyTotals,

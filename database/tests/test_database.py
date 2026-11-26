@@ -5,6 +5,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 MIGRATION = ROOT / 'database' / 'migrations' / '001_initial.sql'
 AUDIT_MIGRATION = ROOT / 'database' / 'migrations' / '002_audit_log_append_only.sql'
+TELEGRAM_MIGRATION = ROOT / 'database' / 'migrations' / '003_telegram_notifications.sql'
 NOW = '2026-11-23T18:00:00.000Z'
 
 
@@ -14,6 +15,8 @@ class MowxBackDatabaseTests(unittest.TestCase):
         self.db.row_factory = sqlite3.Row
         self.db.execute('PRAGMA foreign_keys = ON')
         self.db.executescript(MIGRATION.read_text(encoding='utf-8'))
+        self.db.executescript(AUDIT_MIGRATION.read_text(encoding='utf-8'))
+        self.db.executescript(TELEGRAM_MIGRATION.read_text(encoding='utf-8'))
         self.db.execute("INSERT INTO items(id,name,is_active,created_at,updated_at) VALUES ('item-1','صنف تجريبي',1,?,?)", (NOW, NOW))
         self.db.execute("INSERT INTO workers(id,name,is_active,created_at,updated_at) VALUES ('worker-1','عامل تجريبي',1,?,?)", (NOW, NOW))
         self.db.commit()
@@ -195,6 +198,20 @@ class MowxBackDatabaseTests(unittest.TestCase):
             legacy.execute("DELETE FROM audit_log WHERE id='legacy-log-1'")
         self.assertEqual(legacy.execute('SELECT COUNT(*) FROM audit_log').fetchone()[0], 2)
         legacy.close()
+
+
+    def test_telegram_migration_preserves_workers_and_withdrawals(self):
+        self.db.execute("UPDATE workers SET phone=? WHERE id='worker-1'", ('+962790000000',))
+        self.db.execute("INSERT INTO withdrawals(id,tx_date,worker_id,worker_name_snapshot,amount_milli,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                        ('before-telegram', '2026-11-23', 'worker-1', 'عامل تجريبي', 2500, 'ملاحظة محفوظة', NOW, NOW))
+        self.db.commit()
+        worker = self.db.execute("SELECT phone FROM workers WHERE id='worker-1'").fetchone()
+        withdrawal = self.db.execute("SELECT amount_milli,notes FROM withdrawals WHERE id='before-telegram'").fetchone()
+        self.assertEqual(worker['phone'], '+962790000000')
+        self.assertEqual((withdrawal['amount_milli'], withdrawal['notes']), (2500, 'ملاحظة محفوظة'))
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0], 3)
+        self.assertEqual(self.db.execute('PRAGMA foreign_key_check').fetchall(), [])
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM telegram_notifications').fetchone()[0], 0)
 
 
 if __name__ == '__main__':

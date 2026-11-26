@@ -25,3 +25,6 @@ Backups/
 Thumbs.db
 .vscode/
 .idea/
+
+# Locally encrypted Telegram credentials
+*telegram*.enc

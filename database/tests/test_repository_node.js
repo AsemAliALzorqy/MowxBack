@@ -50,8 +50,27 @@ database.transaction = (callback) => (...args) => {
 };
 
 function run() {
-  const worker = repository.saveCatalogEntry(database, 'worker', { id: 'worker-test-1', name: 'عامل الاختبار' });
+  const worker = repository.saveCatalogEntry(database, 'worker', { id: 'worker-test-1', name: 'عامل الاختبار', phone: '+962790000001' });
+  assert.equal(worker.phone, '+962790000001');
   const category = repository.listCatalogEntries(database, 'expense_category', true)[0];
+
+  // Telegram linking is one-time and the withdrawal outbox row is committed
+  // in the same SQLite transaction as the financial movement.
+  const linkToken = 'A'.repeat(48);
+  const tokenHash = require('node:crypto').createHash('sha256').update(linkToken).digest('hex');
+  repository.createTelegramLinkToken(database, {
+    workerId: worker.id, tokenHash, tokenEncrypted: 'test-encrypted-token',
+    expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+  });
+  assert.equal(repository.listTelegramWorkerStates(database).find((entry) => entry.id === worker.id).telegram.status, 'pending');
+  const linked = repository.completeTelegramLink(database, {
+    tokenHash, chatId: '123456789', username: 'worker_test', firstName: 'عامل', lastName: 'الاختبار',
+  });
+  assert.equal(linked.workerId, worker.id);
+  assert.equal(repository.listTelegramWorkerStates(database).find((entry) => entry.id === worker.id).telegram.status, 'linked');
+  assert.throws(() => repository.completeTelegramLink(database, { tokenHash, chatId: '123456789' }), /غير صالح|انتهت/);
+  repository.setAppSetting(database, 'telegramBusinessName', 'مصنع التجربة');
+  repository.setAppSetting(database, 'telegramEnabled', true);
 
   const movement = repository.createProfitMovement(database, {
     id: 'profit-test-1', date: '2026-11-23', lines: [
@@ -80,8 +99,38 @@ function run() {
   });
   repository.createWithdrawal(database, {
     id: 'withdrawal-test-1', date: '2026-11-23', workerId: worker.id,
-    amountMilli: 2000, notes: 'دفعة',
+    amountMilli: 2000, notes: 'دفعة خاصة',
   });
+  const queuedTelegram = database.prepare('SELECT * FROM telegram_notifications WHERE withdrawal_id=?').get('withdrawal-test-1');
+  assert.ok(queuedTelegram, 'A linked worker receives an outbox entry only after the withdrawal transaction is saved.');
+  assert.equal(queuedTelegram.status, 'pending');
+  const telegramPayload = JSON.parse(queuedTelegram.payload_json);
+  assert.equal(telegramPayload.workerName, 'عامل الاختبار');
+  assert.equal(telegramPayload.notes, 'دفعة خاصة');
+  assert.equal(telegramPayload.businessName, 'مصنع التجربة');
+  assert.equal(telegramPayload.amountMilli, 2000);
+  assert.equal(telegramPayload.currencyLabel, '\u20C1');
+  assert.equal(repository.markTelegramNotificationSending(database, queuedTelegram.id), true);
+  repository.markTelegramNotificationSent(database, queuedTelegram.id, 765);
+  assert.equal(repository.listTelegramNotificationHistory(database, 5).find((entry) => entry.id === queuedTelegram.id).status, 'sent');
+
+  repository.unlinkTelegramWorker(database, worker.id);
+  assert.equal(repository.listTelegramWorkerStates(database).find((entry) => entry.id === worker.id).telegram.status, 'unlinked');
+  repository.setAppSetting(database, 'telegramEnabled', false);
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM telegram_notifications').get().n, 1);
+
+  const optionalDb = new DatabaseSync(':memory:');
+  optionalDb.exec(fs.readFileSync(path.join(__dirname, '..', 'schema.sql'), 'utf8'));
+  optionalDb.exec('PRAGMA foreign_keys = ON');
+  optionalDb.transaction = (callback) => (...args) => {
+    optionalDb.exec('BEGIN IMMEDIATE');
+    try { const result = callback(...args); optionalDb.exec('COMMIT'); return result; }
+    catch (error) { optionalDb.exec('ROLLBACK'); throw error; }
+  };
+  const optionalWorker = repository.saveCatalogEntry(optionalDb, 'worker', { id: 'optional-worker', name: 'عامل دون Telegram' });
+  repository.createWithdrawal(optionalDb, { id: 'optional-withdrawal', date: '2026-11-23', workerId: optionalWorker.id, amountMilli: 1000, notes: '' });
+  assert.equal(optionalDb.prepare('SELECT COUNT(*) AS n FROM telegram_notifications').get().n, 0, 'The app must save withdrawals normally when Telegram is not enabled.');
+  optionalDb.close();
 
   // Dynamic report options include catalog items and names captured in live profit lines.
   const reportOptions = repository.listReportOptions(database);
@@ -156,6 +205,7 @@ function run() {
   assert.equal(database.prepare("SELECT amount_milli FROM withdrawals WHERE id='withdrawal-test-1'").get().amount_milli, 3000);
   assert.deepEqual(repository.getAppSettings(database), {
     currencyCode: 'JOD', currencyLabel: 'د.أ', currencyDecimalPlaces: 3,
+    telegramEnabled: false, telegramBusinessName: 'مصنع التجربة',
   });
 
   assert.equal(database.prepare('PRAGMA integrity_check').get().integrity_check, 'ok');
@@ -255,7 +305,7 @@ function run() {
   } finally {
     fs.rmSync(tempDirectory, { recursive: true, force: true });
   }
-  console.log('Repository/report/audit integration: report selection, totals, daily reconciliation, append-only audit, legacy import/export, and persistence checks passed.');
+  console.log('Repository/report/audit/Telegram integration: existing reports, totals, audit, persistence, worker linking, one-time tokens, atomic notification outbox, and optional-mode checks passed.');
 }
 
 try { run(); }

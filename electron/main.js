@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const {
@@ -8,6 +9,8 @@ const {
   dialog,
   ipcMain,
   shell,
+  safeStorage,
+  clipboard,
 } = require('electron');
 const { openDatabase, integrityReport } = require('../src/database/db');
 const {
@@ -20,6 +23,8 @@ const { importLegacyBackup } = require('../src/database/legacy-import');
 const Repository = require('../src/database/repository');
 const Money = require('../src/database/money');
 const { DiagnosticLogger } = require('./diagnostic-logger');
+const { TelegramBotService, buildWithdrawalMessage, escapeHtml } = require('./telegram-service');
+const { toSvgDataUrl } = require('./qr-code');
 
 let mainWindow = null;
 let db = null;
@@ -28,6 +33,12 @@ let runtimeConfig = null;
 let isQuitting = false;
 let diagnostics = null;
 let shutdownFlushRequested = false;
+let telegramService = null;
+let telegramStartupError = '';
+let telegramQueueProcessing = false;
+let telegramQueueIdle = Promise.resolve();
+let resolveTelegramQueueIdle = null;
+let telegramRuntimeTransition = Promise.resolve();
 
 function logDiagnostic(event, details = {}, level = 'info') {
   if (!diagnostics) return Promise.resolve();
@@ -72,9 +83,10 @@ async function readRuntimeConfig() {
     return {
       databasePath: typeof parsed.databasePath === 'string' ? parsed.databasePath : null,
       backupDirectory: typeof parsed.backupDirectory === 'string' ? parsed.backupDirectory : null,
+      telegramUpdateOffset: Number.isSafeInteger(parsed.telegramUpdateOffset) ? parsed.telegramUpdateOffset : 0,
     };
   } catch (error) {
-    if (error.code === 'ENOENT') return { databasePath: null, backupDirectory: null };
+    if (error.code === 'ENOENT') return { databasePath: null, backupDirectory: null, telegramUpdateOffset: 0 };
     throw new Error(`تعذر قراءة إعدادات تشغيل MowxBack: ${error.message}`);
   }
 }
@@ -87,6 +99,217 @@ async function saveRuntimeConfig(patch) {
   await fs.writeFile(temp, JSON.stringify(next, null, 2), 'utf8');
   await fs.rename(temp, file);
   runtimeConfig = next;
+}
+
+function telegramTokenPath() {
+  return path.join(app.getPath('userData'), 'telegram-bot-token.enc');
+}
+
+function encryptTelegramSecret(token) {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('التخزين الآمن غير متاح على هذا الجهاز؛ لم يتم حفظ رمز Telegram.');
+  }
+  return safeStorage.encryptString(token).toString('base64');
+}
+
+async function readTelegramToken() {
+  try {
+    if (!safeStorage.isEncryptionAvailable()) throw new Error('التخزين الآمن غير متاح لفك تشفير رمز Telegram.');
+    const encoded = await fs.readFile(telegramTokenPath(), 'utf8');
+    return safeStorage.decryptString(Buffer.from(encoded, 'base64'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return '';
+    throw error;
+  }
+}
+
+async function writeTelegramToken(token) {
+  const encrypted = encryptTelegramSecret(token);
+  const target = telegramTokenPath();
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  const temporary = `${target}.${process.pid}.tmp`;
+  await fs.writeFile(temporary, encrypted, { encoding: 'utf8', mode: 0o600 });
+  await fs.rename(temporary, target);
+}
+
+async function deleteTelegramToken() {
+  try { await fs.unlink(telegramTokenPath()); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+}
+
+async function processTelegramOutbox(service) {
+  if (telegramQueueProcessing || !service || !service.running || !db) return;
+  const settings = Repository.getAppSettings(db);
+  if (settings.telegramEnabled !== true) return;
+  telegramQueueProcessing = true;
+  telegramQueueIdle = new Promise((resolve) => { resolveTelegramQueueIdle = resolve; });
+  try {
+    const pending = Repository.listPendingTelegramNotifications(db, new Date().toISOString(), 10);
+    for (const notification of pending) {
+      if (!service.running) break;
+      if (!Repository.markTelegramNotificationSending(db, notification.id)) continue;
+      try {
+        const sent = await service.sendMessage(notification.chatId, buildWithdrawalMessage(notification.payload));
+        Repository.markTelegramNotificationSent(db, notification.id, sent.message_id);
+        void logDiagnostic('telegram-notification-sent', { notificationId: notification.id, withdrawalId: notification.withdrawalId });
+      } catch (error) {
+        const attempt = notification.attempts + 1;
+        const ambiguousDelivery = error.deliveryAmbiguous === true || (!error.telegramCode && error.deliveryAmbiguous !== false);
+        const delay = error.retryAfter ? Number(error.retryAfter) * 1000 : Math.min(60000 * (2 ** Math.max(0, attempt - 1)), 6 * 60 * 60 * 1000);
+        const reason = ambiguousDelivery
+          ? 'تعذر تأكيد نتيجة الإرسال بسبب انقطاع الاتصال. تحقق من محادثة العامل قبل إعادة المحاولة لتجنب تكرار الرسالة.'
+          : String(error.message || error).slice(0, 450);
+        Repository.markTelegramNotificationRetry(db, notification.id, reason, new Date(Date.now() + delay).toISOString(), ambiguousDelivery ? 1 : 7);
+        void logDiagnostic('telegram-notification-failed', { notificationId: notification.id, withdrawalId: notification.withdrawalId, attempt, ambiguousDelivery, message: reason.slice(0, 250) }, 'warning');
+      }
+    }
+  } finally {
+    telegramQueueProcessing = false;
+    const resolve = resolveTelegramQueueIdle;
+    resolveTelegramQueueIdle = null;
+    if (resolve) resolve();
+  }
+}
+
+async function handleTelegramMessage(service, message) {
+  if (!message?.chat || message.chat.type !== 'private') return;
+  const text = String(message.text || '').trim();
+  const match = /^\/start(?:@[A-Za-z0-9_]+)?(?:\s+([A-Za-z0-9_-]{1,64}))?/.exec(text);
+  if (!match || !match[1]) {
+    await service.sendMessage(message.chat.id,
+      'أهلاً بك في إشعارات MowxBack. للحصول على الإشعارات، اطلب رابط ربط خاصاً من مسؤول النظام وافتحه ثم اضغط Start.');
+    return;
+  }
+  const tokenHash = crypto.createHash('sha256').update(match[1]).digest('hex');
+  let linked;
+  try {
+    linked = Repository.completeTelegramLink(db, {
+      tokenHash,
+      chatId: String(message.chat.id),
+      username: message.from?.username || '',
+      firstName: message.from?.first_name || '',
+      lastName: message.from?.last_name || '',
+    });
+  } catch (error) {
+    await service.sendMessage(message.chat.id,
+      `تعذر ربط الحساب. ${escapeHtml(error.message || 'رابط الربط غير صالح.')}\n\nاطلب رابطاً جديداً من مسؤول النظام.`);
+    void logDiagnostic('telegram-link-rejected', { reason: String(error.message || error).slice(0, 220) }, 'warning');
+    return;
+  }
+
+  notifyTelegramWorkersChanged();
+  void logDiagnostic('telegram-worker-linked', { workerId: linked.workerId });
+  try {
+    await service.sendMessage(message.chat.id,
+      `أهلاً بك، <b>${escapeHtml(linked.workerName)}</b>.\n\nتم ربط حساب Telegram الخاص بك بنظام إشعارات MowxBack بنجاح.\n\nستصلك هنا إشعارات فورية عند تسجيل أي سحب مالي جديد باسمك، تتضمن المبلغ والتاريخ وبيان السحب، والملاحظة إذا كانت موجودة.\n\nهذه المحادثة مخصصة لاستقبال إشعارات السحبيات من جهة العمل المرتبطة بالنظام.`);
+  } catch (error) {
+    void logDiagnostic('telegram-welcome-delivery-failed', { workerId: linked.workerId, message: String(error.message || error).slice(0, 220) }, 'warning');
+  }
+}
+
+function createTelegramService(token) {
+  const service = new TelegramBotService({
+    token,
+    onMessage: (message) => handleTelegramMessage(service, message),
+    onLog: (event, details, level) => { void logDiagnostic(event, details, level || 'info'); },
+    getOffset: () => Number(runtimeConfig?.telegramUpdateOffset) || 0,
+    saveOffset: (offset) => saveRuntimeConfig({ telegramUpdateOffset: offset }),
+  });
+  service.setQueueProcessor(() => processTelegramOutbox(service));
+  return service;
+}
+
+function serializeTelegramRuntime(task) {
+  const operation = telegramRuntimeTransition.then(task, task);
+  telegramRuntimeTransition = operation.catch(() => {});
+  return operation;
+}
+
+async function startTelegramRuntime(token) {
+  return serializeTelegramRuntime(async () => {
+    if (telegramService) await telegramService.stop();
+    telegramService = null;
+    await telegramQueueIdle;
+    const next = createTelegramService(token);
+    const info = await next.start();
+    telegramService = next;
+    telegramStartupError = '';
+    void logDiagnostic('telegram-polling-started', { botUsername: info.username || '' });
+    return info;
+  });
+}
+
+async function stopTelegramRuntime() {
+  return serializeTelegramRuntime(async () => {
+    if (telegramService) await telegramService.stop();
+    telegramService = null;
+    await telegramQueueIdle;
+  });
+}
+
+function notifyTelegramWorkersChanged() {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('mowx:telegram-link-changed');
+}
+
+function getTelegramStatus() {
+  const settings = Repository.getAppSettings(db);
+  return {
+    enabled: settings.telegramEnabled === true,
+    configured: Boolean(telegramService || settings.telegramBotUsername),
+    active: Boolean(telegramService?.running),
+    botUsername: settings.telegramBotUsername || telegramService?.status().botUsername || '',
+    businessName: settings.telegramBusinessName || '',
+    verifiedAt: settings.telegramVerifiedAt || null,
+    error: telegramStartupError || telegramService?.status().error || '',
+    linkedWorkers: Repository.listTelegramWorkerStates(db).filter((worker) => worker.telegram.status === 'linked').length,
+    workers: Repository.listTelegramWorkerStates(db),
+    notifications: Repository.listTelegramNotificationHistory(db, 40),
+  };
+}
+
+function getTelegramLink(workerId) {
+  const settings = Repository.getAppSettings(db);
+  if (settings.telegramEnabled !== true || !telegramService?.running) {
+    throw new Error('فعّل Telegram واتصل بالبوت أولاً من الإعدادات.');
+  }
+  const worker = Repository.listTelegramWorkerStates(db).find((entry) => entry.id === workerId);
+  if (!worker) throw new Error('العامل غير موجود.');
+  if (worker.telegram.status === 'linked') throw new Error('العامل مرتبط بالفعل بحساب Telegram.');
+  let active = Repository.getActiveTelegramLinkToken(db, workerId);
+  let token;
+  if (active) {
+    try {
+      if (!safeStorage.isEncryptionAvailable()) throw new Error('التخزين الآمن غير متاح لاسترجاع رابط الربط.');
+      token = safeStorage.decryptString(Buffer.from(active.token_encrypted, 'base64'));
+    } catch (error) {
+      // A pending link may have been restored from another Windows profile.
+      // Replace only this short-lived, unused token rather than blocking sharing.
+      void logDiagnostic('telegram-link-token-replaced', { workerId, reason: 'pending-token-not-decryptable' }, 'warning');
+      active = null;
+    }
+  }
+  if (!active) {
+    token = crypto.randomBytes(24).toString('base64url');
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    Repository.createTelegramLinkToken(db, {
+      workerId, tokenHash, expiresAt,
+      tokenEncrypted: encryptTelegramSecret(token),
+    });
+    notifyTelegramWorkersChanged();
+  }
+  const botUsername = settings.telegramBotUsername || telegramService.status().botUsername;
+  if (!/^[A-Za-z0-9_]{5,32}$/.test(String(botUsername || ''))) throw new Error('تعذر تحديد اسم مستخدم البوت. أعد التحقق من إعدادات Telegram.');
+  return { worker, url: `https://t.me/${botUsername}?start=${token}`, expiresAt: active?.expires_at || new Date(Date.now() + 10 * 60 * 1000).toISOString() };
+}
+
+async function verifyTelegramToken(token) {
+  const activeToken = String(token || '').trim() || await readTelegramToken();
+  if (!activeToken) throw new Error('أدخل Bot Token أولاً.');
+  const checker = new TelegramBotService({ token: activeToken });
+  const me = await checker.getMe();
+  const webhook = await checker.getWebhookInfo();
+  return { ok: true, botName: me.first_name || '', username: me.username || '', hasWebhook: Boolean(webhook.url) };
 }
 
 async function chooseDirectory(title) {
@@ -258,7 +481,8 @@ function registerIpc() {
     const settings = currencySettings();
     const allSettings = Repository.getAppSettings(db);
     const mapCatalog = (kind) => Repository.listCatalogEntries(db, kind, true)
-      .map((entry) => ({ id: entry.id, name: entry.name, active: Boolean(entry.is_active) }));
+      .map((entry) => ({ id: entry.id, name: entry.name, phone: entry.phone || '', active: Boolean(entry.is_active) }));
+    const telegramWorkers = new Map(Repository.listTelegramWorkerStates(db).map((worker) => [worker.id, worker.telegram]));
     const status = {
       databasePath: dbPath,
       backupDirectory: runtimeConfig.backupDirectory,
@@ -271,8 +495,13 @@ function registerIpc() {
       demo: Boolean(allSettings.legacyDemoFlag),
       ...settings,
       items: mapCatalog('item'),
-      workers: mapCatalog('worker'),
+      workers: mapCatalog('worker').map((worker) => ({ ...worker, telegram: telegramWorkers.get(worker.id) || { status: 'unlinked' } })),
       cats: mapCatalog('expense_category'),
+      telegram: {
+        enabled: allSettings.telegramEnabled === true,
+        active: Boolean(telegramService?.running),
+        botUsername: allSettings.telegramBotUsername || '',
+      },
       tx: Repository.listAllTransactions(db),
       names: Repository.listNameSuggestionHistory(db).map((row) => row.display_name),
       log: Repository.listAuditLog(db, 200),
@@ -313,7 +542,7 @@ function registerIpc() {
         currencyCode: state.currencyCode,
         currency: state.currency,
         items: state.items,
-        workers: state.workers,
+        workers: state.workers.map(({ id, name, phone, active }) => ({ id, name, phone: phone || '', active })),
         cats: state.cats,
         names: state.names,
         tx: Repository.listTransactionsForLegacyExport(db),
@@ -632,13 +861,15 @@ function registerIpc() {
 
   registerIpcHandler('mowx:create-withdrawal', (payload) => {
     requiredObject(payload, 'Withdrawal');
-    return Repository.createWithdrawal(db, {
+    const result = Repository.createWithdrawal(db, {
       id: payload.id ? stringValue(payload.id, 'Withdrawal ID', 160) : undefined,
       date: stringValue(payload.date, 'Withdrawal date', 10),
       workerId: stringValue(payload.refId, 'Worker ID', 160),
       amountMilli: amountMilli(payload.amount),
       notes: stringValue(payload.note || '', 'Withdrawal notes', 4000),
     });
+    if (telegramService?.running) void processTelegramOutbox(telegramService);
+    return result;
   });
   registerIpcHandler('mowx:update-withdrawal', (payload) => {
     requiredObject(payload, 'Withdrawal update');
@@ -662,6 +893,7 @@ function registerIpc() {
     return Repository.saveCatalogEntry(db, kind, {
       id: payload.id ? stringValue(payload.id, 'Catalog ID', 160) : undefined,
       name: stringValue(payload.name, 'Catalog name', 300),
+      phone: kind === 'worker' ? stringValue(payload.phone || '', 'Worker phone', 40) : '',
     });
   });
   registerIpcHandler('mowx:set-catalog-active', (payload) => {
@@ -670,6 +902,142 @@ function registerIpc() {
     if (!kind) throw new TypeError('Unknown catalog section.');
     return Repository.setCatalogActive(db, kind, stringValue(payload.id, 'Catalog ID', 160), payload.active);
   });
+  registerIpcHandler('mowx:telegram-status', () => getTelegramStatus());
+  registerIpcHandler('mowx:telegram-verify-token', async (payload) => {
+    const token = payload && payload.token !== undefined ? stringValue(payload.token, 'Telegram Bot Token', 256) : '';
+    const result = await verifyTelegramToken(token);
+    Repository.setAppSetting(db, 'telegramVerifiedAt', new Date().toISOString());
+    return result;
+  });
+  registerIpcHandler('mowx:telegram-save-token', async (payload) => {
+    requiredObject(payload, 'Telegram Bot Token');
+    const token = stringValue(payload.token, 'Telegram Bot Token', 256).trim();
+    if (!token) throw new Error('أدخل Bot Token أولاً.');
+    const verified = await verifyTelegramToken(token);
+    if (verified.hasWebhook) throw new Error('هذا البوت لديه Webhook مفعّل. أزل Webhook يدوياً قبل تفعيل Long Polling؛ لم يغيّر MowxBack إعداد Webhook.');
+    const previousUsername = Repository.getAppSettings(db).telegramBotUsername || '';
+    const sameBot = previousUsername && previousUsername.toLowerCase() === verified.username.toLowerCase();
+    await stopTelegramRuntime();
+    if (!sameBot) {
+      Repository.clearTelegramLinks(db);
+      await saveRuntimeConfig({ telegramUpdateOffset: 0 });
+    }
+    await writeTelegramToken(token);
+    Repository.setAppSetting(db, 'telegramBotUsername', verified.username);
+    Repository.setAppSetting(db, 'telegramVerifiedAt', new Date().toISOString());
+    Repository.setAppSetting(db, 'telegramEnabled', true);
+    try {
+      await startTelegramRuntime(token);
+    } catch (error) {
+      telegramStartupError = String(error.message || error).slice(0, 300);
+      Repository.setAppSetting(db, 'telegramEnabled', false);
+      throw error;
+    }
+    void logDiagnostic('telegram-token-configured', { botUsername: verified.username });
+    return getTelegramStatus();
+  });
+  registerIpcHandler('mowx:telegram-disconnect', async () => {
+    Repository.setAppSetting(db, 'telegramEnabled', false);
+    Repository.cancelPendingTelegramNotifications(db);
+    await stopTelegramRuntime();
+    Repository.clearTelegramLinks(db);
+    await deleteTelegramToken();
+    await saveRuntimeConfig({ telegramUpdateOffset: 0 });
+    Repository.setAppSetting(db, 'telegramBotUsername', '');
+    telegramStartupError = '';
+    notifyTelegramWorkersChanged();
+    void logDiagnostic('telegram-disconnected-and-credentials-removed');
+    return getTelegramStatus();
+  });
+  registerIpcHandler('mowx:telegram-set-enabled', async (payload) => {
+    requiredObject(payload, 'Telegram enabled state');
+    if (typeof payload.enabled !== 'boolean') throw new TypeError('Telegram enabled state must be boolean.');
+    if (!payload.enabled) {
+      Repository.setAppSetting(db, 'telegramEnabled', false);
+      Repository.cancelPendingTelegramNotifications(db);
+      await stopTelegramRuntime();
+      void logDiagnostic('telegram-disabled');
+      return getTelegramStatus();
+    }
+    const token = await readTelegramToken();
+    if (!token) throw new Error('أدخل Bot Token واحفظه قبل تفعيل Telegram.');
+    const verified = await verifyTelegramToken(token);
+    if (verified.hasWebhook) throw new Error('يوجد Webhook مفعّل لهذا البوت؛ لا يمكن تشغيل Long Polling حالياً.');
+    await startTelegramRuntime(token);
+    Repository.setAppSetting(db, 'telegramBotUsername', verified.username);
+    Repository.setAppSetting(db, 'telegramVerifiedAt', new Date().toISOString());
+    Repository.setAppSetting(db, 'telegramEnabled', true);
+    if (telegramService?.running) void processTelegramOutbox(telegramService);
+    void logDiagnostic('telegram-enabled', { botUsername: verified.username });
+    return getTelegramStatus();
+  });
+  registerIpcHandler('mowx:telegram-save-business-name', (payload) => {
+    requiredObject(payload, 'Telegram business name');
+    const name = stringValue(payload.name || '', 'Business name', 120).trim();
+    Repository.setAppSetting(db, 'telegramBusinessName', name);
+    void logDiagnostic('telegram-business-name-updated', { hasBusinessName: Boolean(name) });
+    return getTelegramStatus();
+  });
+  registerIpcHandler('mowx:telegram-create-link', (payload) => {
+    requiredObject(payload, 'Telegram worker link');
+    const workerId = stringValue(payload.workerId, 'Worker ID', 160);
+    const link = getTelegramLink(workerId);
+    return { workerName: link.worker.name, expiresAt: link.expiresAt };
+  });
+  registerIpcHandler('mowx:telegram-copy-link', (payload) => {
+    requiredObject(payload, 'Telegram worker link');
+    const link = getTelegramLink(stringValue(payload.workerId, 'Worker ID', 160));
+    clipboard.writeText(link.url);
+    void logDiagnostic('telegram-link-copied', { workerId: payload.workerId });
+    return { copied: true, expiresAt: link.expiresAt };
+  });
+  registerIpcHandler('mowx:telegram-show-qr', (payload) => {
+    requiredObject(payload, 'Telegram worker QR');
+    const link = getTelegramLink(stringValue(payload.workerId, 'Worker ID', 160));
+    return { dataUrl: toSvgDataUrl(link.url), expiresAt: link.expiresAt, workerName: link.worker.name };
+  });
+  registerIpcHandler('mowx:telegram-open-whatsapp', async (payload) => {
+    requiredObject(payload, 'WhatsApp share');
+    const workerId = stringValue(payload.workerId, 'Worker ID', 160);
+    const link = getTelegramLink(workerId);
+    let phone = String(link.worker.phone || '').trim();
+    if (phone.startsWith('00')) phone = `+${phone.slice(2)}`;
+    const digits = phone.replace(/\D/g, '');
+    if (!phone.startsWith('+') || digits.length < 8 || digits.length > 15) {
+      throw new Error('أدخل رقم الهاتف بصيغة دولية مع رمز الدولة، مثل +9627XXXXXXXX.');
+    }
+    const message = `مرحباً، هذا رابط ربط حسابك بنظام إشعارات السحبيات في MowxBack عبر Telegram. افتح الرابط واضغط Start لإتمام الربط:\n${link.url}`;
+    await shell.openExternal(`https://wa.me/${digits}?text=${encodeURIComponent(message)}`);
+    void logDiagnostic('telegram-link-whatsapp-opened', { workerId });
+    return { opened: true, expiresAt: link.expiresAt };
+  });
+  registerIpcHandler('mowx:telegram-unlink-worker', (payload) => {
+    requiredObject(payload, 'Telegram unlink');
+    const workerId = stringValue(payload.workerId, 'Worker ID', 160);
+    const result = Repository.unlinkTelegramWorker(db, workerId);
+    notifyTelegramWorkersChanged();
+    void logDiagnostic('telegram-worker-unlinked', { workerId });
+    return result;
+  });
+  registerIpcHandler('mowx:telegram-test-message', async (payload) => {
+    requiredObject(payload, 'Telegram test message');
+    if (!telegramService?.running) throw new Error('Telegram غير متصل حالياً.');
+    const workerId = stringValue(payload.workerId, 'Worker ID', 160);
+    const worker = Repository.listTelegramWorkerStates(db).find((item) => item.id === workerId);
+    if (!worker || worker.telegram.status !== 'linked') throw new Error('اختر عاملاً مرتبطاً بحساب Telegram.');
+    const link = db.prepare('SELECT chat_id FROM telegram_worker_links WHERE worker_id=?').get(workerId);
+    await telegramService.sendMessage(link.chat_id, `هذه رسالة اختبار من <b>MowxBack</b>.\nإشعارات السحبيات مفعّلة للعامل: <b>${escapeHtml(worker.name)}</b>.`);
+    void logDiagnostic('telegram-test-message-sent', { workerId });
+    return { sent: true };
+  });
+  registerIpcHandler('mowx:telegram-retry-notification', (payload) => {
+    requiredObject(payload, 'Telegram notification retry');
+    const id = stringValue(payload.id, 'Notification ID', 160);
+    const changed = Repository.retryTelegramNotification(db, id);
+    if (changed && telegramService?.running) void processTelegramOutbox(telegramService);
+    return { queued: changed };
+  });
+
   registerIpcHandler('mowx:set-currency', (payload) => {
     requiredObject(payload, 'Currency settings');
     const code = stringValue(payload.code, 'Currency code', 12);
@@ -827,6 +1195,22 @@ app.whenReady().then(async () => {
       return;
     }
     registerIpc();
+    const telegramSettings = Repository.getAppSettings(db);
+    if (telegramSettings.telegramEnabled === true) {
+      try {
+        const storedToken = await readTelegramToken();
+        if (storedToken) {
+          Repository.recoverTelegramSending(db);
+          await startTelegramRuntime(storedToken);
+        } else {
+          telegramStartupError = 'رمز Telegram غير موجود في مخزن الأسرار؛ أعد إدخاله من الإعدادات.';
+          Repository.setAppSetting(db, 'telegramEnabled', false);
+        }
+      } catch (telegramError) {
+        telegramStartupError = String(telegramError.message || telegramError).slice(0, 300);
+        void logDiagnostic('telegram-startup-failed', { message: telegramStartupError }, 'warning');
+      }
+    }
     createWindow();
     await logDiagnostic('application-ready', { appVersion: app.getVersion() });
     app.on('activate', () => {
@@ -851,7 +1235,7 @@ app.on('before-quit', (event) => {
     shutdownFlushRequested = true;
     event.preventDefault();
     void logDiagnostic('application-shutdown-requested');
-    void diagnostics.flush().finally(() => {
+    void stopTelegramRuntime().finally(() => diagnostics.flush()).finally(() => {
       if (db && db.open) {
         try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch (_) {}
         try { db.close(); } catch (_) {}

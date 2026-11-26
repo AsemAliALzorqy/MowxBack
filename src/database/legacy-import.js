@@ -50,7 +50,7 @@ function parseAndValidateLegacyBackup(rawText) {
 }
 
 function isBusinessDatabaseEmpty(db) {
-  const tables = ['items', 'workers', 'profit_transactions', 'profit_lines', 'expenses', 'withdrawals', 'name_suggestions', 'audit_log', 'legacy_imports'];
+  const tables = ['items', 'workers', 'profit_transactions', 'profit_lines', 'expenses', 'withdrawals', 'name_suggestions', 'audit_log', 'legacy_imports', 'telegram_worker_links', 'telegram_link_tokens', 'telegram_notifications'];
   const noBusinessRows = tables.every((table) => db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n === 0);
   const hasCustomCategories = db.prepare(`SELECT 1 FROM expense_categories
     WHERE id NOT IN ('builtin-food','builtin-fuel','builtin-maintenance') LIMIT 1`).get();
@@ -74,8 +74,8 @@ function importLegacyBackup(db, rawText, sourceName = '') {
   const insertCatalog = {
     items: db.prepare(`INSERT INTO items(id, name, is_active, created_at, updated_at)
                        VALUES (@id, @name, @active, @created, @updated)`),
-    workers: db.prepare(`INSERT INTO workers(id, name, is_active, created_at, updated_at)
-                         VALUES (@id, @name, @active, @created, @updated)`),
+    workers: db.prepare(`INSERT INTO workers(id, name, phone, is_active, created_at, updated_at)
+                         VALUES (@id, @name, @phone, @active, @created, @updated)`),
     cats: db.prepare(`INSERT INTO expense_categories(id, name, is_active, created_at, updated_at)
                       VALUES (@id, @name, @active, @created, @updated)`),
   };
@@ -97,7 +97,7 @@ function importLegacyBackup(db, rawText, sourceName = '') {
         if (seen.has(id)) throw new Error(`Duplicate legacy ID in ${kind}: ${id}`);
         seen.add(id);
         const active = entry.active === false || entry.active === 0 ? 0 : 1;
-        insertCatalog[kind].run({ id, name, active, created: now, updated: now });
+        insertCatalog[kind].run({ id, name, ...(kind === 'workers' ? { phone: String(entry.phone || '').slice(0, 40) } : {}), active, created: now, updated: now });
       }
     }
 
